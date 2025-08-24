@@ -18,6 +18,7 @@
 #include "sim.h"
 #include "threadpool.h"
 #include <mutex>
+#include <cctype>
 
 using rg::Deleter;
 
@@ -177,7 +178,7 @@ int align_main(int argc, char *argv[]) {
     pg.name = "vargas_align";
     pg.id = "VA";
     pg.version = __DATE__;
-    std::replace_if(pg.version.begin(), pg.version.end(), isspace, ' '); // rm tabs
+    std::replace_if(pg.version.begin(), pg.version.end(), [](char c) { return std::isspace(c); }, ' '); // rm tabs
     const auto assigned_pgid = reads_hdr.add(pg);
 
     size_t read_len;
@@ -727,7 +728,7 @@ void load_fast(std::string &file, const bool fastq, vargas::isam &ret, bool p64)
         for (unsigned i = 0; i < lines.size(); i += (fastq ? 4 : 2)) {
             vargas::SAM::Record rec;
             rec.query_name = std::string(lines.at(i).begin() + 1,
-                                         std::find_if(lines.at(i).begin() + 1, lines.at(i).end(), isspace));
+                                         std::find_if(lines.at(i).begin() + 1, lines.at(i).end(), [](char c) { return std::isspace(c); }));
             rec.seq = lines.at(i + 1);
             if (fastq) rec.qual = lines.at(i + 3);
             if (p64) std::transform(rec.qual.begin(), rec.qual.end(), rec.qual.begin(), [](char c){return c-31;});

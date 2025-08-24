@@ -2,11 +2,11 @@ cmake_minimum_required(VERSION 2.8)
 
 project("vargas")
 
-set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
-set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)
+# Remove fixed output paths - let CMake use build directory
+# set(EXECUTABLE_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/bin)
+# set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/lib)
 
-include_directories(doctest/doctest include htslib cxxopts/src)
-link_directories(${PROJECT_SOURCE_DIR}/htslib)
+include_directories(doctest/doctest include cxxopts/src)
 
 set(MAIN_SOURCES
         src/main.cpp
@@ -57,9 +57,9 @@ else()
 endif()
 
 add_executable(vargas ${MAIN_SOURCES})
-target_link_libraries(vargas hts)
+target_link_libraries(vargas vcflib tabixpp hts)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11 -pthread")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++17 -pthread")
 set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -DNDEBUG")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g -pedantic -Wall -Wextra -Wno-unused-function -fno-inline")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELEASE} ${CMAKE_CXX_FLAGS_DEBUG}")

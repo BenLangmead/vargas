@@ -4,3 +4,5 @@ bin
 build
 cmake-*
 doc/html
+test
+build-*

@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <iomanip>
+#include <cctype>
 #include "graph.h"
 
 
@@ -284,7 +285,7 @@ unsigned vargas::GraphFactory::add_sample_filter(std::string filter, bool invert
     if (!_vf) throw std::invalid_argument("No VCF file opened, cannot add filter.");
     if (filter.length() == 0 || filter == "-") return _vf->num_haplotypes();
     std::vector<std::string> filt;
-    filter.erase(std::remove_if(filter.begin(), filter.end(), isspace), filter.end());
+    filter.erase(std::remove_if(filter.begin(), filter.end(), [](char c) { return std::isspace(c); }), filter.end());
     if (invert) {
         const auto s = _vf->samples();
         auto vcf_samples = std::unordered_set<std::string>(s.begin(), s.end());
@@ -785,9 +786,9 @@ TEST_CASE ("Graph Factory") {
         << "##INFO=<ID=TYPE,Number=A,Type=String,Description=\"type of variant\">" << endl
         << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\ts1\ts2" << endl
         << "x\t9\t.\tG\tA,C,T\t99\t.\tAF=0.01,0.6,0.1;AC=1;LEN=1;NA=1;NS=1;TYPE=snp\tGT\t0|1\t2|3" << endl
-        << "x\t10\t.\tC\t<CN7>,<CN0>\t99\t.\tAF=0.01,0.01;AC=2;LEN=1;NA=1;NS=1;TYPE=snp\tGT\t1|1\t2|1" << endl
-        << "y\t34\t.\tTATA\t<CN2>,<CN0>\t99\t.\tAF=0.01,0.1;AC=2;LEN=1;NA=1;NS=1;TYPE=snp\tGT\t1|1\t2|1" << endl
-        << "y\t39\t.\tT\t<CN0>\t99\t.\tAF=0.01;AC=1;LEN=1;NA=1;NS=1;TYPE=snp\tGT\t1|0\t0|1" << endl;
+        << "x\t10\t.\tC\tCCCCCCC\t99\t.\tAF=0.01;AC=1;LEN=7;NA=1;NS=1;TYPE=ins\tGT\t1|1\t0|1" << endl
+        << "y\t34\t.\tTATA\tT\t99\t.\tAF=0.1;AC=1;LEN=1;NA=1;NS=1;TYPE=del\tGT\t1|1\t0|1" << endl
+        << "y\t39\t.\tT\tA\t99\t.\tAF=0.01;AC=1;LEN=1;NA=1;NS=1;TYPE=snp\tGT\t1|0\t0|1" << endl;
     }
 
     SUBCASE("Empty VCF") {

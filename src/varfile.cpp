@@ -14,6 +14,9 @@
  */
 
 #include "varfile.h"
+#include <unistd.h>
+#include <algorithm>
+#include <sstream>
 
 vargas::Region vargas::parse_region(const std::string &region_str) {
     vargas::Region ret;
@@ -51,45 +54,120 @@ void vargas::VCF::set_region(const Region &region) {
 
 
 std::vector<std::string> vargas::VCF::seq_names() const {
-    if (!_header) return std::vector<std::string>(0);
+    if (!_vcf) return std::vector<std::string>(0);
+    
+    // Extract sequence names from vcflib header
     std::vector<std::string> ret;
-    int num;
-    // As per htslib, only top level is freed.
-    const char **seqnames = bcf_hdr_seqnames(_header, &num);
-    if (!seqnames) {
-        throw std::invalid_argument("Error reading VCF header.");
+    std::string header = _vcf->header;
+    
+    // Parse header lines to find contig information
+    std::istringstream header_stream(header);
+    std::string line;
+    while (std::getline(header_stream, line)) {
+        if (line.substr(0, 8) == "##contig") {
+            // Extract contig name from ##contig=<ID=chr1,length=...>
+            size_t id_pos = line.find("ID=");
+            if (id_pos != std::string::npos) {
+                size_t start = id_pos + 3;
+                size_t end = line.find(',', start);
+                if (end == std::string::npos) {
+                    end = line.find('>', start);
+                }
+                if (end != std::string::npos) {
+                    ret.push_back(line.substr(start, end - start));
+                }
+            }
+        }
     }
-    for (int i = 0; i < num; ++i) {
-        ret.emplace_back(seqnames[i]);
-    }
-    free(seqnames);
+    
     return ret;
 }
 
 
 bool vargas::VCF::next() {
     if (_limit > 0 && _counter >= _limit) return false;
-    if (!_header || !_bcf) return false;
-    bool seqmatch;
-    do {
-        if (bcf_read(_bcf, _header, _curr_rec) != 0) return false;
-        seqmatch = _region.seq_name.empty() || strcmp(_region.seq_name.c_str(), bcf_seqname(_header, _curr_rec)) == 0;
-        if (seqmatch) _entered_contig = true;
-        else if (_assume_contig && _entered_contig) return false;
-    } while (!seqmatch || unsigned(_curr_rec->pos) < _region.min || (_region.max > 0 && unsigned(_curr_rec->pos) > _region.max));
-
-    unpack_all();
-    gen_genotypes();
-    ++_counter;
-    return true;
+    if (!_vcf) return false;
+    
+    // Keep reading until we find a record that matches our region filter
+    while (true) {
+        // Read next variant using vcflib
+        if (!_vcf->getNextVariant(*_curr_var)) {
+            return false;
+        }
+        
+        // Check region filtering
+        bool seqmatch = _region.seq_name.empty() || _curr_var->sequenceName == _region.seq_name;
+        if (seqmatch) {
+            _entered_contig = true;
+        } else if (_assume_contig && _entered_contig) {
+            return false;
+        } else {
+            continue;
+        }
+        
+        // Check position filtering
+        if (unsigned(_curr_var->position) < _region.min || (_region.max > 0 && unsigned(_curr_var->position) > _region.max)) {
+            continue; // Skip this record and try the next one
+        }
+        
+        // Found a matching record, load data and return
+        _load_shared();
+        gen_genotypes();
+        ++_counter;
+        return true;
+    }
 }
 
 
 const std::vector<std::string> &vargas::VCF::gen_genotypes() {
-    FormatField<int> gt(_header, _curr_rec, "GT");
-    _genotypes.resize(gt.values.size());
-    for (size_t i = 0; i < _genotypes.size(); ++i) {
-        _genotypes[i] = (_alleles[bcf_gt_allele(gt.values.at(i))]);
+    _genotypes.clear();
+    
+    // Determine which samples to process
+    std::vector<std::string> samplesToProcess;
+    if (_ingroup.empty()) {
+        // No filter, process all samples
+        samplesToProcess = _vcf->sampleNames;
+    } else {
+        // Filter to only include samples in _ingroup
+        for (const auto& sampleName : _vcf->sampleNames) {
+            if (std::find(_ingroup.begin(), _ingroup.end(), sampleName) != _ingroup.end()) {
+                samplesToProcess.push_back(sampleName);
+            }
+        }
+    }
+    
+    // Get genotypes from vcflib variant
+    for (const auto& sampleName : samplesToProcess) {
+        auto sampleIt = _curr_var->samples.find(sampleName);
+        if (sampleIt != _curr_var->samples.end()) {
+            auto gtIt = sampleIt->second.find("GT");
+            if (gtIt != sampleIt->second.end() && !gtIt->second.empty()) {
+                // Parse GT field (e.g., "0|1" or "1/0")
+                std::string gt_str = gtIt->second[0];
+                std::vector<std::string> gt_parts = rg::split(gt_str, "|/");
+                
+                for (const auto& gt_part : gt_parts) {
+                    if (gt_part == "." || gt_part.empty()) {
+                        _genotypes.push_back("*");  // Missing genotype
+                    } else {
+                        int allele_idx = std::stoi(gt_part);
+                        if (allele_idx >= 0 && static_cast<size_t>(allele_idx) < _alleles.size()) {
+                            _genotypes.push_back(_alleles[allele_idx]);
+                        } else {
+                            _genotypes.push_back("*");  // Invalid genotype
+                        }
+                    }
+                }
+            } else {
+                // Missing GT field
+                _genotypes.push_back("*");
+                _genotypes.push_back("*");
+            }
+        } else {
+            // Missing sample
+            _genotypes.push_back("*");
+            _genotypes.push_back("*");
+        }
     }
 
     // Map of which indivs have each allele
@@ -97,8 +175,14 @@ const std::vector<std::string> &vargas::VCF::gen_genotypes() {
     for (auto &allele : alleles()) {
         _genotype_indivs[allele] = Population(_genotypes.size(), false);
     }
+    // Also add entry for missing genotypes
+    _genotype_indivs["*"] = Population(_genotypes.size(), false);
+    
     for (size_t s = 0; s < _genotypes.size(); ++s) {
-        _genotype_indivs[_genotypes[s]].set(s);
+        auto it = _genotype_indivs.find(_genotypes[s]);
+        if (it != _genotype_indivs.end()) {
+            it->second.set(s);
+        }
     }
 
     return _genotypes;
@@ -106,7 +190,7 @@ const std::vector<std::string> &vargas::VCF::gen_genotypes() {
 
 
 const std::vector<float> &vargas::VCF::frequencies() const {
-    InfoField<float> af(_header, _curr_rec, "AF");
+    InfoField<float> af(_curr_var, "AF");
     static std::vector<float> _allele_freqs;
     const auto &val = af.values;
     _allele_freqs.resize(val.size() + 1); // make room for the ref
@@ -144,18 +228,21 @@ int vargas::VCF::_init() {
     _counter = 0;
     _limit = 0;
     if (_file_name.length() && _file_name != "-") {
-        _bcf = bcf_open(_file_name.c_str(), "r");
-        if (!_bcf) return -1;
 
-        _header = bcf_hdr_read(_bcf);
-        if (_header == nullptr) {
-            return -2;
+        
+        // Open VCF file using vcflib
+        _vcf = new vcflib::VariantCallFile();
+        if (!_vcf->open(_file_name)) {
+            delete _vcf;
+            _vcf = nullptr;
+            return -1;
         }
+
+        // Initialize the variant object
+        _curr_var = new vcflib::Variant(*_vcf);
 
         // Load samples
-        for (size_t i = 0; i < num_haplotypes() / 2; ++i) {
-            _samples.emplace_back(_header->samples[i]);
-        }
+        _samples = _vcf->sampleNames;
         create_ingroup(100);
     }
     return 0;
@@ -164,16 +251,28 @@ int vargas::VCF::_init() {
 
 void vargas::VCF::_load_shared() {
     _alleles.clear();
-    for (int i = 0; i < _curr_rec->n_allele; ++i) {
-        std::string allele(_curr_rec->d.allele[i]);
-        // Some replacement tag
+    
+    // Check if _curr_var is valid
+    if (!_curr_var) {
+        return;
+    }
+    
+    for (size_t i = 0; i < _curr_var->alleles.size(); ++i) {
+        std::string allele = _curr_var->alleles[i];
+        
+        // Handle special replacement tags
         if (allele.at(0) == '<') {
-            std::string ref = _curr_rec->d.allele[0];
+            std::string ref = _curr_var->ref;
             // Copy number
             if (allele.substr(1, 2) == "CN" && allele.at(3) != 'V') {
                 int copy = std::stoi(allele.substr(3, allele.length() - 4));
-                allele = "";
-                for (int o = 0; o < copy; ++o) allele += ref;
+                if (copy == 0) {
+                    // CN0 means deletion - use empty string as per VCF spec
+                    allele = "";
+                } else {
+                    allele = "";
+                    for (int o = 0; o < copy; ++o) allele += ref;
+                }
             } else {
                 // Other types are just subbed with the ref.
                 allele = ref;
@@ -181,61 +280,39 @@ void vargas::VCF::_load_shared() {
         }
         _alleles.push_back(allele);
     }
+    
+
 }
+
+
 
 
 void vargas::VCF::_apply_ingroup_filter() {
-    if (_header == nullptr) {
+    if (_vcf == nullptr) {
         throw std::logic_error("Ingroup filter should only be applied after loading header!");
     }
 
-    if (_ingroup.empty()) {
-        if (_ingroup_cstr != nullptr) {
-            free(_ingroup_cstr);
-        }
-        _ingroup_cstr = nullptr;
-    } else if (_ingroup.size() == _samples.size()) {
-        if (_ingroup_cstr != nullptr) {
-            free(_ingroup_cstr);
-        }
-        _ingroup_cstr = (char *) malloc(2);
-        strcpy(_ingroup_cstr, "-");
-    } else {
-        std::ostringstream ss;
-        for (const auto& s : _ingroup) ss << s << ',';
-        std::string smps = ss.str().substr(0, ss.str().length() - 1);
-        if (_ingroup_cstr != nullptr) {
-            free(_ingroup_cstr);
-        }
-        _ingroup_cstr = (char *) malloc(smps.length() + 1);
-        strcpy(_ingroup_cstr, smps.c_str());
-    }
-
-    bcf_hdr_set_samples(_header, _ingroup_cstr, 0);
+    // For vcflib, we don't need to set samples in the header
+    // The filtering will be done when reading variants
+    // This is a simplified implementation
 }
 
 size_t vargas::VCF::num_haplotypes() const {
-    if (_header == nullptr) {
+    if (_vcf == nullptr) {
         return 0;
     }
-    return (size_t) bcf_hdr_nsamples(_header) * 2;
+    return (size_t) _vcf->sampleNames.size() * 2;
 }
 
 void vargas::VCF::close() {
-    if (_bcf) bcf_close(_bcf);
-    if (_header != nullptr) {
-        bcf_hdr_destroy(_header);
+    if (_curr_var) {
+        delete _curr_var;
+        _curr_var = nullptr;
     }
-    if (_curr_rec != nullptr) {
-        bcf_destroy(_curr_rec);
+    if (_vcf) {
+        delete _vcf;
+        _vcf = nullptr;
     }
-    if (_ingroup_cstr != nullptr) {
-        free(_ingroup_cstr);
-    }
-    _bcf = nullptr;
-    _header = nullptr;
-    _curr_rec = nullptr;
-    _ingroup_cstr = nullptr;
 }
 
 TEST_SUITE("VCF Parser");
@@ -439,6 +516,74 @@ TEST_CASE ("VCF File handler") {
             CHECK(af[1] == 0.01f);
             CHECK(af[2] == 0.6f);
             CHECK(af[3] == 0.1f);
+        }
+
+        SUBCASE("INFO field parsing") {
+            vargas::VCF vcf;
+            vcf.open(tmpvcf);
+            vcf.next();
+
+            // Test INFO field extraction
+            auto af_values = vcf.info_tag<float>("AF");
+            REQUIRE(af_values.size() == 3);
+            CHECK(af_values[0] == 0.01f);
+            CHECK(af_values[1] == 0.6f);
+            CHECK(af_values[2] == 0.1f);
+
+            auto ac_values = vcf.info_tag<int>("AC");
+            REQUIRE(ac_values.size() == 1);
+            CHECK(ac_values[0] == 1);
+
+            auto ns_values = vcf.info_tag<int>("NS");
+            REQUIRE(ns_values.size() == 1);
+            CHECK(ns_values[0] == 1);
+        }
+
+        SUBCASE("FORMAT field parsing") {
+            vargas::VCF vcf;
+            vcf.open(tmpvcf);
+            vcf.next();
+
+            // Test FORMAT field extraction
+            auto gt_values = vcf.format_tag<std::string>("GT");
+            REQUIRE(gt_values.size() == 2); // 2 samples, each with one GT value
+            CHECK(gt_values[0] == "0|1"); // First sample: s1
+            CHECK(gt_values[1] == "2|3"); // Second sample: s2
+        }
+
+        SUBCASE("Multiple record iteration") {
+            vargas::VCF vcf;
+            vcf.open(tmpvcf);
+            
+            int record_count = 0;
+            std::vector<std::string> expected_refs = {"G", "C", "G", "TATA", "T"};
+            
+            while (vcf.next()) {
+                REQUIRE(record_count < expected_refs.size());
+                CHECK(vcf.ref() == expected_refs[record_count]);
+                record_count++;
+            }
+            
+            CHECK(record_count == 5); // Should read all 5 records
+        }
+
+        SUBCASE("Empty VCF handling") {
+            // Create an empty VCF file
+            std::string empty_vcf = "empty_test.vcf";
+            {
+                std::ofstream vcfo(empty_vcf);
+                vcfo << "##fileformat=VCFv4.1" << std::endl
+                     << "##FORMAT=<ID=GT,Number=1,Type=String,Description=\"Genotype\">" << std::endl
+                     << "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT" << std::endl;
+            }
+
+            vargas::VCF vcf;
+            vcf.open(empty_vcf);
+            
+            // Should return false immediately
+            CHECK(vcf.next() == false);
+            
+            remove(empty_vcf.c_str());
         }
 
     }
