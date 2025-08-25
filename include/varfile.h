@@ -434,6 +434,15 @@ namespace vargas {
           _assume_contig = true;
       }
 
+      /**
+       * @brief
+       * Set whether Population objects should use all samples or filtered samples.
+       * @param use_all true to use all samples, false to use filtered samples
+       */
+      void set_use_all_samples_for_population(bool use_all) {
+          _use_all_samples_for_population = use_all;
+      }
+
     protected:
 
       /**
@@ -473,6 +482,7 @@ namespace vargas {
       size_t _limit, _counter;
 
       bool _assume_contig, _entered_contig;
+      bool _use_all_samples_for_population = false; // Flag to control Population size
 
   };
 

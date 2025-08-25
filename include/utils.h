@@ -31,14 +31,11 @@
 #define RESTRICT
 #endif
 
-#ifndef RG_DISABLE_INLINE
-#if defined(__GNUC__)
+#if defined(__GNUC__) || defined(__clang__)
 #define __RG_STRONG_INLINE__ __attribute__((always_inline)) inline
-#else
+#elif defined(_MSC_VER)
 #define __RG_STRONG_INLINE__ inline
-#endif
 #else
-#pragma message("No strong inlining")
 #define __RG_STRONG_INLINE__ inline
 #endif
 

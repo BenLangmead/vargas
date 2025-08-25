@@ -172,16 +172,73 @@ const std::vector<std::string> &vargas::VCF::gen_genotypes() {
 
     // Map of which indivs have each allele
     _genotype_indivs.clear();
+    size_t population_size = _use_all_samples_for_population ? _vcf->sampleNames.size() * 2 : _genotypes.size();
     for (auto &allele : alleles()) {
-        _genotype_indivs[allele] = Population(_genotypes.size(), false);
+        _genotype_indivs[allele] = Population(population_size, false);
     }
     // Also add entry for missing genotypes
-    _genotype_indivs["*"] = Population(_genotypes.size(), false);
+    _genotype_indivs["*"] = Population(population_size, false);
     
-    for (size_t s = 0; s < _genotypes.size(); ++s) {
-        auto it = _genotype_indivs.find(_genotypes[s]);
-        if (it != _genotype_indivs.end()) {
-            it->second.set(s);
+    if (_use_all_samples_for_population) {
+        // Map filtered genotype indices to full haplotype positions
+        size_t genotype_idx = 0;
+        for (const auto& sampleName : samplesToProcess) {
+            auto sampleIt = _curr_var->samples.find(sampleName);
+            if (sampleIt != _curr_var->samples.end()) {
+                auto gtIt = sampleIt->second.find("GT");
+                if (gtIt != sampleIt->second.end() && !gtIt->second.empty()) {
+                    std::string gt_str = gtIt->second[0];
+                    std::vector<std::string> gt_parts = rg::split(gt_str, "|/");
+                    
+                    for (size_t haplotype = 0; haplotype < gt_parts.size(); ++haplotype) {
+                        if (genotype_idx < _genotypes.size()) {
+                            auto it = _genotype_indivs.find(_genotypes[genotype_idx]);
+                            if (it != _genotype_indivs.end()) {
+                                // Find the position of this sample in the full sample list
+                                auto full_sample_it = std::find(_vcf->sampleNames.begin(), _vcf->sampleNames.end(), sampleName);
+                                if (full_sample_it != _vcf->sampleNames.end()) {
+                                    size_t sample_idx = std::distance(_vcf->sampleNames.begin(), full_sample_it);
+                                    size_t haplotype_pos = sample_idx * 2 + haplotype;
+                                    it->second.set(haplotype_pos);
+                                }
+                            }
+                            genotype_idx++;
+                        }
+                    }
+                } else {
+                    // Missing GT field - set both haplotypes for this sample
+                    auto full_sample_it = std::find(_vcf->sampleNames.begin(), _vcf->sampleNames.end(), sampleName);
+                    if (full_sample_it != _vcf->sampleNames.end()) {
+                        size_t sample_idx = std::distance(_vcf->sampleNames.begin(), full_sample_it);
+                        auto it = _genotype_indivs.find("*");
+                        if (it != _genotype_indivs.end()) {
+                            it->second.set(sample_idx * 2);
+                            it->second.set(sample_idx * 2 + 1);
+                        }
+                    }
+                    genotype_idx += 2;
+                }
+            } else {
+                // Missing sample - set both haplotypes for this sample
+                auto full_sample_it = std::find(_vcf->sampleNames.begin(), _vcf->sampleNames.end(), sampleName);
+                if (full_sample_it != _vcf->sampleNames.end()) {
+                    size_t sample_idx = std::distance(_vcf->sampleNames.begin(), full_sample_it);
+                    auto it = _genotype_indivs.find("*");
+                    if (it != _genotype_indivs.end()) {
+                        it->second.set(sample_idx * 2);
+                        it->second.set(sample_idx * 2 + 1);
+                    }
+                }
+                genotype_idx += 2;
+            }
+        }
+    } else {
+        // Use filtered samples only
+        for (size_t s = 0; s < _genotypes.size(); ++s) {
+            auto it = _genotype_indivs.find(_genotypes[s]);
+            if (it != _genotype_indivs.end()) {
+                it->second.set(s);
+            }
         }
     }
 
