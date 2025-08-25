@@ -18,6 +18,7 @@
 #include "sim.h"
 #include "threadpool.h"
 #include <mutex>
+#include <cctype>
 
 using rg::Deleter;
 
@@ -177,7 +178,7 @@ int align_main(int argc, char *argv[]) {
     pg.name = "vargas_align";
     pg.id = "VA";
     pg.version = __DATE__;
-    std::replace_if(pg.version.begin(), pg.version.end(), isspace, ' '); // rm tabs
+    std::replace_if(pg.version.begin(), pg.version.end(), [](char c) { return std::isspace(c); }, ' '); // rm tabs
     const auto assigned_pgid = reads_hdr.add(pg);
 
     size_t read_len;
@@ -188,11 +189,11 @@ int align_main(int argc, char *argv[]) {
         std::cerr << "[warn] Number of threads is greater than number of tasks. Try decreasing -u.\n";
     }
 
-    threads = threads ? threads > task_list.size() ? task_list.size() : threads
+    threads = threads ? (static_cast<unsigned int>(threads) > static_cast<unsigned int>(task_list.size()) ? static_cast<int>(task_list.size()) : threads)
                       : 1;
 
     int bias = 255 - (read_len * match);
-    const bool use_wide = (bias < 0) or (end_to_end and (static_cast<signed long long>(prof.ref_gopen + (prof.ref_gext * (read_len - 1))) > bias || read_len * prof.mismatch_max > bias));
+    const bool use_wide = (bias < 0) or (end_to_end and (static_cast<signed long long>(prof.ref_gopen + (prof.ref_gext * (read_len - 1))) > bias || static_cast<signed long long>(read_len * prof.mismatch_max) > bias));
     if (use_wide) {
         std::cerr << "Score range: " << read_len * match << " to -" << std::min(prof.ref_gopen + (prof.ref_gext * (read_len - 1)), read_len * prof.mismatch_max) <<
         ". Using 16-bit aligner (" << vargas::WordAligner::read_capacity() << " reads/vector).\n";
@@ -200,7 +201,7 @@ int align_main(int argc, char *argv[]) {
     std::cerr << "Scoring profile: " << prof.to_string() << "\n";
 
     std::vector<std::unique_ptr<vargas::AlignerBase, rg::Deleter>> aligners(threads);
-    for (size_t k = 0; k < threads; ++k) {
+    for (size_t k = 0; k < static_cast<size_t>(threads); ++k) {
         aligners[k] = make_aligner(prof, read_len, use_wide, msonly, maxonly);
     }
 
@@ -336,7 +337,7 @@ void align_helper_func(void *data, long index, int tid) {
 
                 // Fill the matrixes
                 bool has_quality = rec.seq.size() == quals[j].size();
-                for (unsigned col = 1; col <= ref_len; ++col) {
+                for (unsigned col = 1; col <= static_cast<unsigned>(ref_len); ++col) {
                     char ref_char = rg::num_to_base(*ref_iter);
                     for (unsigned row = 1; row <= rec.seq.length(); ++row) {
                         char query_char = rec.seq[row-1];
@@ -460,7 +461,7 @@ void align_helper_func(void *data, long index, int tid) {
                     int bestRow = -1;
                     int best = -1;
                     int bestMatrix = -1;
-                    for (int row = 0; row <= rec.seq.length(); ++row) {
+                    for (int row = 0; row <= static_cast<int>(rec.seq.length()); ++row) {
                         if (M[row][ref_len] > best) {
                             best = M[row][ref_len];
                             bestRow = row;
@@ -685,7 +686,7 @@ T *construct_aligned(Args &&...args) {
 
 
 std::unique_ptr<vargas::AlignerBase, Deleter>
-make_aligner(const vargas::ScoreProfile &prof, size_t read_len, bool use_wide, bool msonly, bool maxonly) {
+make_aligner(const vargas::ScoreProfile &prof, size_t read_len, bool use_wide, bool msonly, bool /* maxonly */) {
     std::unique_ptr<vargas::AlignerBase, Deleter> ret;
     if (msonly) {
         if (prof.end_to_end) {
@@ -727,7 +728,7 @@ void load_fast(std::string &file, const bool fastq, vargas::isam &ret, bool p64)
         for (unsigned i = 0; i < lines.size(); i += (fastq ? 4 : 2)) {
             vargas::SAM::Record rec;
             rec.query_name = std::string(lines.at(i).begin() + 1,
-                                         std::find_if(lines.at(i).begin() + 1, lines.at(i).end(), isspace));
+                                         std::find_if(lines.at(i).begin() + 1, lines.at(i).end(), [](char c) { return std::isspace(c); }));
             rec.seq = lines.at(i + 1);
             if (fastq) rec.qual = lines.at(i + 3);
             if (p64) std::transform(rec.qual.begin(), rec.qual.end(), rec.qual.begin(), [](char c){return c-31;});

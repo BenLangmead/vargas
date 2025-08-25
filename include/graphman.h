@@ -150,13 +150,13 @@ namespace vargas {
       }
 
       std::shared_ptr<Graph> at(std::string label) const {
-          std::transform(label.begin(), label.end(), label.begin(), tolower);
+          std::transform(label.begin(), label.end(), label.begin(), [](char c) { return std::tolower(c); });
           if (!count(label)) throw std::domain_error("No graph named \"" + label + "\"");
           return _graphs.at(label);
       }
 
       std::shared_ptr<Graph> operator[](std::string label) {
-          std::transform(label.begin(), label.end(), label.begin(), tolower);
+          std::transform(label.begin(), label.end(), label.begin(), [](char c) { return std::tolower(c); });
           return _graphs[label];
       }
 

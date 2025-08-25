@@ -22,8 +22,7 @@
 
 #include "dyn_bitset.h"
 #include "utils.h"
-#include "htslib/vcfutils.h"
-#include "htslib/hts.h"
+#include "vcflib/Variant.h"
 
 #include <string>
 #include <cstdio>
@@ -36,6 +35,8 @@
 #include <set>
 #include <unordered_map>
 #include <map>
+#include <type_traits>
+#include <cctype>
 
 namespace vargas {
 
@@ -146,47 +147,31 @@ namespace vargas {
         public:
           /**
            * Get the specified field tag.
-           * @param hdr VCF Header
-           * @param rec current record
+           * @param var current variant
            * @param tag Field to get, e.g. "GT"
            */
-          FormatField(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag) : tag(tag) {
-              if (!hdr || !rec || tag.length() == 0) throw std::invalid_argument("Invalid header, rec, or tag.");
-
-              T *dst = nullptr;
-              int n_arr = 0;
-
-              int n = _get_vals(hdr, rec, tag, &dst, n_arr);
-
-              /*
-              if (n == -1) throw std::invalid_argument("No such tag in header: " + tag);
-              else if (n == -2) throw std::invalid_argument("Header and tag type clash: " + tag);
-              else if (n == -3) throw std::invalid_argument(tag + " does not exist in record.");
-               */
-
-              for (int i = 0; i < n; ++i) {
-                  values.push_back(dst[i]);
+          FormatField(vcflib::Variant *var, std::string tag) : tag(tag) {
+              if (!var || tag.length() == 0) throw std::invalid_argument("Invalid variant or tag.");
+              for (const auto& sample : var->samples) {
+                  auto fieldIt = sample.second.find(tag);
+                  if (fieldIt != sample.second.end()) {
+                      for (const auto& value : fieldIt->second) {
+                          if constexpr (std::is_same_v<T, int>) {
+                              values.push_back(std::stoi(value));
+                          } else if constexpr (std::is_same_v<T, float>) {
+                              values.push_back(std::stof(value));
+                          } else if constexpr (std::is_same_v<T, std::string>) {
+                              values.push_back(value);
+                          } else {
+                              values.push_back(T{});
+                          }
+                      }
+                  }
               }
-
-              if (dst) free(dst); // get_format_values allocates
           }
 
           std::vector<T> values; /**< Retrieved values. */
           std::string tag; /**< Type of FORMAT or INFO field. */
-
-        private:
-          // Change the parse type based on what kind of type we have
-          inline int _get_vals(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, int32_t **dst, int &ndst) {
-              return bcf_get_format_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_INT);
-          }
-
-          inline int _get_vals(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, float **dst, int &ndst) {
-              return bcf_get_format_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_REAL);
-          }
-
-          inline int _get_vals(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, char **dst, int &ndst) {
-              return bcf_get_format_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_STR);
-          }
       };
 
       /**
@@ -200,48 +185,30 @@ namespace vargas {
           /**
            * @brief
            * Get the specified field.
-           * @param hdr VCF Header
-           * @param rec current record
-           * @param tag Field to get, e.g. "GT"
+           * @param var current variant
+           * @param tag Field to get, e.g. "AF"
            */
-          InfoField(bcf_hdr_t *hdr,
-                    bcf1_t *rec,
-                    std::string tag) : tag(tag) {
-              if (!hdr || !rec || tag.length() == 0) throw std::invalid_argument("Invalid header, rec, or tag.");
-
-              T *dst = nullptr;
-              int n_arr = 0;
-
-              int n = _bcf_get_info_values(hdr, rec, tag, &dst, n_arr);
-              /*
-              if (n == -1) throw std::invalid_argument("No such tag in header: " + tag);
-              else if (n == -2) throw std::invalid_argument("Header and tag type clash: " + tag);
-              else if (n == -3) throw std::invalid_argument(tag + " does not exist in record.");
-              */
-              for (int i = 0; i < n; ++i) {
-                  values.push_back(dst[i]);
+          InfoField(vcflib::Variant *var, std::string tag) : tag(tag) {
+              if (!var || tag.length() == 0) throw std::invalid_argument("Invalid variant or tag.");
+              auto infoIt = var->info.find(tag);
+              if (infoIt != var->info.end()) {
+                  for (const auto& value : infoIt->second) {
+                      if constexpr (std::is_same_v<T, int>) {
+                          values.push_back(std::stoi(value));
+                      } else if constexpr (std::is_same_v<T, float>) {
+                          values.push_back(std::stof(value));
+                      } else if constexpr (std::is_same_v<T, std::string>) {
+                          values.push_back(value);
+                      } else {
+                          values.push_back(T{});
+                      }
+                  }
               }
-
-              if (dst) free(dst);
           }
 
           std::vector<T> values;
           /**< Retrieved values */
           std::string tag; /**< Type of FORMAT or INFO field. */
-
-        private:
-          // Change the parse type based on what kind of type we have
-          inline int _bcf_get_info_values(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, int32_t **dst, int &ndst) {
-              return bcf_get_info_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_INT);
-          }
-
-          inline int _bcf_get_info_values(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, float **dst, int &ndst) {
-              return bcf_get_info_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_REAL);
-          }
-
-          inline int _bcf_get_info_values(bcf_hdr_t *hdr, bcf1_t *rec, std::string tag, char **dst, int &ndst) {
-              return bcf_get_info_values(hdr, rec, tag.c_str(), (void **) dst, &ndst, BCF_HT_STR);
-          }
       };
 
       /**
@@ -258,17 +225,22 @@ namespace vargas {
       void close();
 
       bool good() {
-          return _header && _bcf;
+          return _vcf && _curr_var;
       }
 
       /**
        * @brief
-       * Ingroup parameter on BCF reading. Empty string indicates none, "-" indicates all.
+       * Ingroup parameter on VCF reading. Empty string indicates none, "-" indicates all.
        * @return string of ingroup samples
        */
       std::string ingroup_str() const {
-          if (!_ingroup_cstr) return "-";
-          return std::string(_ingroup_cstr);
+          if (_ingroup.empty()) return "-";
+          std::string result;
+          for (size_t i = 0; i < _ingroup.size(); ++i) {
+              if (i > 0) result += ",";
+              result += _ingroup[i];
+          }
+          return result;
       }
 
       /**
@@ -305,11 +277,10 @@ namespace vargas {
 
       /**
        * @brief
-       * Unpacks shared information as well as all sample information.
+       * Loads shared information as well as all sample information.
        * Subject to sample set restrictions.
        */
       void unpack_all() {
-          bcf_unpack(_curr_rec, BCF_UN_ALL);
           _load_shared();
       }
 
@@ -319,7 +290,7 @@ namespace vargas {
        * @return reference allele
        */
       std::string ref() const {
-          return _alleles[0];
+          return _curr_var ? _curr_var->ref : "";
       }
 
       /**
@@ -340,7 +311,7 @@ namespace vargas {
        * @return position.
        */
       pos_t pos() const {
-          return _curr_rec->pos;
+          return _curr_var ? _curr_var->position - 1 : 0;  // Convert to 0-based
       }
 
       /**
@@ -372,7 +343,7 @@ namespace vargas {
        */
       template<typename T>
       std::vector<T> info_tag(std::string tag) {
-          return InfoField<T>(_header, _curr_rec, tag).values;
+          return InfoField<T>(_curr_var, tag).values;
       }
 
       /**
@@ -384,7 +355,7 @@ namespace vargas {
       */
       template<typename T>
       std::vector<T> format_tag(std::string tag) {
-          return FormatField<T>(_header, _curr_rec, tag).values;
+          return FormatField<T>(_curr_var, tag).values;
       }
 
       /**
@@ -407,7 +378,7 @@ namespace vargas {
        * @return true if file is open and has a valid header.
        */
       bool good() const {
-          return _header && _bcf;
+          return _vcf && _curr_var;
       }
 
       /**
@@ -463,6 +434,15 @@ namespace vargas {
           _assume_contig = true;
       }
 
+      /**
+       * @brief
+       * Set whether Population objects should use all samples or filtered samples.
+       * @param use_all true to use all samples, false to use filtered samples
+       */
+      void set_use_all_samples_for_population(bool use_all) {
+          _use_all_samples_for_population = use_all;
+      }
+
     protected:
 
       /**
@@ -490,20 +470,19 @@ namespace vargas {
       std::string _file_name; // VCF/BCF file name
       Region _region;
 
-      htsFile *_bcf = nullptr;
-      bcf_hdr_t *_header = nullptr;
-      bcf1_t *_curr_rec = bcf_init();
+      vcflib::VariantCallFile *_vcf = nullptr;
+      vcflib::Variant *_curr_var = nullptr;
 
       std::vector<std::string> _genotypes; // restricted to _ingroup
       std::unordered_map<std::string, Population> _genotype_indivs;
       std::vector<std::string> _alleles;
       std::vector<std::string> _samples;
       std::vector<std::string> _ingroup; // subset of _samples
-      char *_ingroup_cstr = nullptr;
 
       size_t _limit, _counter;
 
       bool _assume_contig, _entered_contig;
+      bool _use_all_samples_for_population = false; // Flag to control Population size
 
   };
 

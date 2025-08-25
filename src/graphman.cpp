@@ -16,6 +16,7 @@
 
 #include <iomanip>
 #include <iterator>
+#include <cctype>
 #include "graphman.h"
 
 
@@ -47,7 +48,7 @@ vargas::GraphMan::create_base(const std::string fasta, const std::string vcf, st
         _aux["vcf"] = vcf;
         vargas::VCF v(vcf);
         if (!v.good()) throw std::invalid_argument("Invalid VCF: " + vcf);
-        sample_filter.erase(std::remove_if(sample_filter.begin(), sample_filter.end(), isspace), sample_filter.end());
+        sample_filter.erase(std::remove_if(sample_filter.begin(), sample_filter.end(), [](char c) { return std::isspace(c); }), sample_filter.end());
         auto vec = rg::split(sample_filter, ',');
         if (vec.size()) v.create_ingroup(vec);
         if (v.samples().size()) _aux["samples"] = rg::vec_to_str(v.samples(), ",");
@@ -211,7 +212,7 @@ void vargas::GraphMan::open(const std::string &filename) {
 }
 
 std::string vargas::GraphMan::derive(std::string def) {
-    std::transform(def.begin(), def.end(), def.begin(), tolower);
+    std::transform(def.begin(), def.end(), def.begin(), [](char c) { return std::tolower(c); });
 
     std::string ancestor, label, assignment;
     {

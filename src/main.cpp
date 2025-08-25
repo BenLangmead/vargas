@@ -23,6 +23,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 #include <scoring.h>
 #include <mutex>
 
@@ -109,7 +110,7 @@ int define_main(int argc, char *argv[]) {
 
     std::vector<vargas::Region> region_vec;
     if (!region.empty()) {
-        region.erase(std::remove_if(region.begin(), region.end(), isspace), region.end());
+        region.erase(std::remove_if(region.begin(), region.end(), [](char c) { return std::isspace(c); }), region.end());
         region.erase(std::remove(region.begin(), region.end(), ','), region.end());
         auto v = rg::split(region, ';');
         std::transform(v.begin(), v.end(), std::back_inserter(region_vec), vargas::parse_region);
@@ -209,7 +210,7 @@ int sim_main(int argc, char *argv[]) {
         pg.name = "vargas_sim";
         pg.id = "VS";
         pg.version = __DATE__;
-        std::replace_if(pg.version.begin(), pg.version.end(), isspace, ' '); // rm tabs
+        std::replace_if(pg.version.begin(), pg.version.end(), [](char c) { return std::isspace(c); }, ' '); // rm tabs
         sam_hdr.add(pg);
     }
 
@@ -239,7 +240,7 @@ int sim_main(int argc, char *argv[]) {
         subdef_split.emplace_back("base");
     } else {
         std::replace(sim_src.begin(), sim_src.end(), '\n', ',');
-        sim_src.erase(std::remove_if(sim_src.begin(), sim_src.end(), isspace), sim_src.end());
+        sim_src.erase(std::remove_if(sim_src.begin(), sim_src.end(), [](char c) { return std::isspace(c); }), sim_src.end());
         subdef_split = rg::split(sim_src, ',');
 
         // validate graph labels

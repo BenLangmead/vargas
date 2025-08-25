@@ -345,8 +345,14 @@ namespace vargas {
        * Forward iterator to traverse the Graph in insertion order. Checks assume underlying graphs are equal.
        */
       template<typename T, bool FWD, typename Unqualified_T = typename std::remove_cv<T>::type>
-      class GraphIterator: public std::iterator<std::forward_iterator_tag, Unqualified_T, std::ptrdiff_t, T*, T&> {
+      class GraphIterator {
         public:
+          // Iterator traits
+          using iterator_category = std::forward_iterator_tag;
+          using value_type = Unqualified_T;
+          using difference_type = std::ptrdiff_t;
+          using pointer = T*;
+          using reference = T&;
 
           GraphIterator(const GraphIterator &gi) : _graph(gi._graph), _currID(gi._currID), _empty(0) {}
 
