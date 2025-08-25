@@ -189,11 +189,11 @@ int align_main(int argc, char *argv[]) {
         std::cerr << "[warn] Number of threads is greater than number of tasks. Try decreasing -u.\n";
     }
 
-    threads = threads ? threads > task_list.size() ? task_list.size() : threads
+    threads = threads ? (static_cast<unsigned int>(threads) > static_cast<unsigned int>(task_list.size()) ? static_cast<int>(task_list.size()) : threads)
                       : 1;
 
     int bias = 255 - (read_len * match);
-    const bool use_wide = (bias < 0) or (end_to_end and (static_cast<signed long long>(prof.ref_gopen + (prof.ref_gext * (read_len - 1))) > bias || read_len * prof.mismatch_max > bias));
+    const bool use_wide = (bias < 0) or (end_to_end and (static_cast<signed long long>(prof.ref_gopen + (prof.ref_gext * (read_len - 1))) > bias || static_cast<signed long long>(read_len * prof.mismatch_max) > bias));
     if (use_wide) {
         std::cerr << "Score range: " << read_len * match << " to -" << std::min(prof.ref_gopen + (prof.ref_gext * (read_len - 1)), read_len * prof.mismatch_max) <<
         ". Using 16-bit aligner (" << vargas::WordAligner::read_capacity() << " reads/vector).\n";
@@ -201,7 +201,7 @@ int align_main(int argc, char *argv[]) {
     std::cerr << "Scoring profile: " << prof.to_string() << "\n";
 
     std::vector<std::unique_ptr<vargas::AlignerBase, rg::Deleter>> aligners(threads);
-    for (size_t k = 0; k < threads; ++k) {
+    for (size_t k = 0; k < static_cast<size_t>(threads); ++k) {
         aligners[k] = make_aligner(prof, read_len, use_wide, msonly, maxonly);
     }
 
@@ -337,7 +337,7 @@ void align_helper_func(void *data, long index, int tid) {
 
                 // Fill the matrixes
                 bool has_quality = rec.seq.size() == quals[j].size();
-                for (unsigned col = 1; col <= ref_len; ++col) {
+                for (unsigned col = 1; col <= static_cast<unsigned>(ref_len); ++col) {
                     char ref_char = rg::num_to_base(*ref_iter);
                     for (unsigned row = 1; row <= rec.seq.length(); ++row) {
                         char query_char = rec.seq[row-1];
@@ -461,7 +461,7 @@ void align_helper_func(void *data, long index, int tid) {
                     int bestRow = -1;
                     int best = -1;
                     int bestMatrix = -1;
-                    for (int row = 0; row <= rec.seq.length(); ++row) {
+                    for (int row = 0; row <= static_cast<int>(rec.seq.length()); ++row) {
                         if (M[row][ref_len] > best) {
                             best = M[row][ref_len];
                             bestRow = row;
@@ -686,7 +686,7 @@ T *construct_aligned(Args &&...args) {
 
 
 std::unique_ptr<vargas::AlignerBase, Deleter>
-make_aligner(const vargas::ScoreProfile &prof, size_t read_len, bool use_wide, bool msonly, bool maxonly) {
+make_aligner(const vargas::ScoreProfile &prof, size_t read_len, bool use_wide, bool msonly, bool /* maxonly */) {
     std::unique_ptr<vargas::AlignerBase, Deleter> ret;
     if (msonly) {
         if (prof.end_to_end) {

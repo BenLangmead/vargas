@@ -20,6 +20,8 @@
 #include "doctest.h"
 #include <assert.h>
 #include <numeric>
+#include <random>
+#include <algorithm>
 
 const std::string vargas::SAM::Record::REQUIRED_POS = "POS";
 const std::string vargas::SAM::Record::REQUIRED_QNAME = "QNAME";
@@ -400,7 +402,9 @@ void vargas::isam::subset(size_t n) {
 
     std::vector<size_t> idx(pending.size());
     std::iota(idx.begin(), idx.end(), 0);
-    std::random_shuffle(idx.begin(), idx.begin());
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::shuffle(idx.begin(), idx.end(), gen);
 
     if (n >= pending.size() || n == 0) {
         _buff = pending;
