@@ -1,5 +1,5 @@
 # Vargas
-*Updated: March 9th, 2020*
+*Updated: June 30th, 2026*
 
 Vargas computes optimal alignments of short reads to a directed acyclic graph (DAG). After building a graph, reads are aligned using a SIMD-vectorized version of the Smith-Waterman dynamic programming algorithm, with 16 -- 64 reads per vector depending on the instruction set.
 
@@ -7,26 +7,57 @@ Preprint ["Vargas: heuristic-free alignment for assessing linear and graph read 
 
 # Building
 
-When cloning, use the `--recursive` option to automatically retrieve dependencies.
+Vargas is an x86-64 program: its Smith-Waterman core uses SSE/AVX2/AVX-512
+intrinsics and there is no ARM/NEON fallback, so it does not build natively on
+Apple Silicon or other ARM hosts (use an x86-64 machine, or an emulated
+`linux/amd64` container — see `Dockerfile`).
 
-    git clone --recursive git@github.com:langmead-lab/vargas.git
+## Dependencies
 
-Vargas relies on htslib to provide core file processing. Once cloned, the htslib is built with autoconf (version 2.63+).
+Vargas uses [vcflib](https://github.com/vcflib/vcflib) for VCF parsing (which in
+turn pulls in htslib and tabixpp). The build discovers these through
+`pkg-config`, plus the bundled `doctest` and `cxxopts` submodules.
 
-	cd htslib
-    autoconf && autoheader && ./configure && make -j4
+Clone with those two submodules:
 
-Vargas is built with CMake. 
+    git clone git@github.com:langmead-lab/vargas.git
+    cd vargas
+    git submodule update --init doctest cxxopts
 
-With GCC compiler, SSE 4.1 (default), AVX2 (**-DBUILD\_AVX2\_GCC=ON**) or AVX512-BW (**-DBUILD\_AVX512BW\_GCC=ON**) can be targeted for SIMD support. *Requires GCC version 6 or above*
+Install the libraries. With conda/mamba (recommended, works anywhere):
+
+    mamba create -n vargas -c bioconda -c conda-forge vcflib tabixpp htslib cmake make
+    conda activate vargas
+    export PKG_CONFIG_PATH=$CONDA_PREFIX/lib/pkgconfig
+
+Or on Debian/Ubuntu:
+
+    sudo apt-get install cmake pkg-config libvcflib-dev libhts-dev
+
+(On Debian the `.pc` files are on the default `pkg-config` search path, so
+setting `PKG_CONFIG_PATH` is not needed.)
+
+## Compiling
+
+Vargas is built with CMake (>= 3.10).
+
+With the GCC compiler, SSE 4.1 (default), AVX2 (**-DBUILD\_AVX2\_GCC=ON**) or
+AVX512-BW (**-DBUILD\_AVX512BW\_GCC=ON**) can be targeted for SIMD support.
+*Requires GCC version 6 or above.* Match the flag to the most advanced
+instruction set your target CPU supports; AVX-512BW packs 64 reads per vector.
 
     mkdir build && cd build
-    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_AVX512BW_GCC=ON -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc .. && make -j4
-    
-With Intel compiler, AVX2 (**-DBUILD\_AVX2\_INTEL=ON**) or AVX512-BW (**-DBUILD\_AVX512BW\_INTEL=ON**) can be targeted for SIMD support.
+    cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_AVX512BW_GCC=ON .. && make -j4
+
+With the Intel compiler, AVX2 (**-DBUILD\_AVX2\_INTEL=ON**) or AVX512-BW
+(**-DBUILD\_AVX512BW\_INTEL=ON**) can be targeted:
 
     mkdir build && cd build
     cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_AVX512BW_INTEL=ON -DCMAKE_CXX_COMPILER=icpc -DCMAKE_C_COMPILER=icc .. && make -j4
+
+Run the unit tests to confirm the build:
+
+    ./vargas test
 
 
 # Modes of Operation
