@@ -20,6 +20,50 @@
 #include "graphman.h"
 
 
+// --- Relevant-subset bitvector (de)serialization for the .gdef @subsets section ---------------
+// A subset is encoded either sparsely ("s:pos,pos,...") or densely ("d:<little-endian hex>").
+// nbits is the number of sequence ids (the global bit space).
+static vargas::Graph::Population decode_subset(const std::string &enc, size_t nbits) {
+    vargas::Graph::Population pop(nbits, false);
+    if (enc.size() < 2) return pop;
+    if (enc[0] == 's' && enc[1] == ':') {
+        for (const auto &t : rg::split(enc.substr(2), ',')) {
+            if (!t.empty()) { size_t b = std::stoul(t); if (b < nbits) pop.set(b, true); }
+        }
+    } else if (enc[0] == 'd' && enc[1] == ':') {
+        const std::string h = enc.substr(2);
+        for (size_t i = 0; i + 1 < h.size(); i += 2) {
+            unsigned byte = static_cast<unsigned>(std::stoul(h.substr(i, 2), nullptr, 16));
+            size_t base = (i / 2) * 8;
+            for (int b = 0; b < 8; ++b) {
+                if ((byte >> b) & 1u) { size_t idx = base + b; if (idx < nbits) pop.set(idx, true); }
+            }
+        }
+    }
+    return pop;
+}
+
+static std::string encode_subset(const vargas::Graph::Population &pop) {
+    const size_t n = pop.size();
+    std::vector<size_t> setpos;
+    for (size_t i = 0; i < n; ++i) if (pop.at(i)) setpos.push_back(i);
+    if (setpos.size() * 6 < n) {                 // sparse is cheaper when few bits set
+        std::string s = "s:";
+        for (size_t k = 0; k < setpos.size(); ++k) { if (k) s.push_back(','); s += std::to_string(setpos[k]); }
+        return s;
+    }
+    static const char *hexd = "0123456789abcdef";
+    std::string h = "d:";
+    const size_t nbytes = (n + 7) / 8;
+    for (size_t by = 0; by < nbytes; ++by) {
+        unsigned val = 0;
+        for (int b = 0; b < 8; ++b) { size_t idx = by * 8 + b; if (idx < n && pop.at(idx)) val |= (1u << b); }
+        h.push_back(hexd[(val >> 4) & 0xf]); h.push_back(hexd[val & 0xf]);
+    }
+    return h;
+}
+
+
 std::shared_ptr<vargas::Graph>
 vargas::GraphMan::create_base(const std::string fasta, const std::string vcf, std::vector<vargas::Region> region,
                               std::string sample_filter, size_t limvar) {
@@ -88,16 +132,42 @@ void vargas::GraphMan::write(const std::string &filename) {
     std::ofstream of(filename);
     if (!of.good()) throw std::invalid_argument("Error opening file: " + filename);
 
+    const bool have_subsets = !_seqids.empty();
+
     // Meta
     of << "@vgraph\n";
     for (const auto &pair : _aux) {
         of << pair.first << '\t' << pair.second << '\n';
     }
 
+    // Global sequence-id -> bit-position mapping (only when relevant-subset bitvectors are carried)
+    if (have_subsets) {
+        of << "\n@seqids\n";
+        for (size_t i = 0; i < _seqids.size(); ++i) of << i << '\t' << _seqids[i] << '\n';
+    }
+
     // Contigs
     of << "\n@contigs\n";
     for (auto &o : _resolver._contig_offsets) {
         of << o.first << '\t' << o.second << '\n';
+    }
+
+    // De-duplicated table of relevant-subset bitvectors, referenced by id from each @nodes line.
+    std::vector<Graph::Population> subset_table;
+    std::map<unsigned, unsigned> node_subset_id;
+    if (have_subsets) {
+        for (auto &p : *_nodes) {
+            const Graph::Population &pop = p.second.individuals();
+            unsigned sid = subset_table.size();
+            for (unsigned k = 0; k < subset_table.size(); ++k) {
+                if (subset_table[k] == pop) { sid = k; break; }
+            }
+            if (sid == subset_table.size()) subset_table.push_back(pop);
+            node_subset_id[p.first] = sid;
+        }
+        of << "\n@subsets\n";
+        for (unsigned k = 0; k < subset_table.size(); ++k)
+            of << k << '\t' << encode_subset(subset_table[k]) << '\n';
     }
 
     // graphs
@@ -117,7 +187,9 @@ void vargas::GraphMan::write(const std::string &filename) {
     if (_print) std::cerr << "Flushing " << _nodes->size() << " nodes...\n";
     for (auto &p : *_nodes) {
         of << p.first << '\t' << p.second.end_pos() << '\t' << p.second.freq()
-           << '\t' << p.second.is_pinched() << '\t' << p.second.is_ref() << '\t' << p.second.seq().size() << '\n';
+           << '\t' << p.second.is_pinched() << '\t' << p.second.is_ref() << '\t' << p.second.seq().size();
+        if (have_subsets) of << '\t' << node_subset_id[p.first];
+        of << '\n';
         std::for_each(p.second.seq().begin(), p.second.seq().end(), [&of](rg::Base &b){of << rg::num_to_base(b);});
         of << '\n';
     }
@@ -136,7 +208,9 @@ void vargas::GraphMan::open(const std::string &filename) {
     _aux.clear();
     _graphs.clear();
     _resolver._contig_offsets.clear();
+    _seqids.clear();
     _nodes = std::make_shared<Graph::nodemap_t>();
+    std::vector<Graph::Population> subset_table;   // optional @subsets, indexed by subset id
 
     while (std::getline(in, line) && line[0] != '@') {
         if (!line.size()) continue;
@@ -144,6 +218,18 @@ void vargas::GraphMan::open(const std::string &filename) {
         if (tokens.size() == 1) tokens.push_back("");
         if (tokens.size() != 2) throw std::domain_error("Invalid meta-line: " + line);
         _aux[tokens[0]] = tokens[1];
+    }
+
+    // Optional: global sequence-id -> bit-position mapping (index == position)
+    if (line == "@seqids") {
+        while (std::getline(in, line) && line[0] != '@') {
+            if (!line.size()) continue;
+            rg::split(line, '\t', tokens);
+            if (tokens.size() != 2) throw std::domain_error("Invalid seqid def: " + line);
+            unsigned idx = std::stoul(tokens[0]);
+            if (idx >= _seqids.size()) _seqids.resize(idx + 1);
+            _seqids[idx] = tokens[1];
+        }
     }
 
     assert(line == "@contigs");
@@ -154,6 +240,19 @@ void vargas::GraphMan::open(const std::string &filename) {
         if (tokens.size() != 2) throw std::domain_error("Invalid contig def: " + line);
         _resolver._contig_offsets[std::stoul(tokens[0])] = tokens[1];
         _resolver._contig_hdr_order.push_back(tokens[1]);
+    }
+
+    // Optional: de-duplicated relevant-subset bitvector table (over the @seqids bit space)
+    if (line == "@subsets") {
+        const size_t nbits = _seqids.size();
+        while (std::getline(in, line) && line[0] != '@') {
+            if (!line.size()) continue;
+            rg::split(line, '\t', tokens);
+            if (tokens.size() != 2) throw std::domain_error("Invalid subset def: " + line);
+            unsigned sid = std::stoul(tokens[0]);
+            if (sid >= subset_table.size()) subset_table.resize(sid + 1);
+            subset_table[sid] = decode_subset(tokens[1], nbits);
+        }
     }
 
     assert(line == "@graphs");
@@ -190,7 +289,7 @@ void vargas::GraphMan::open(const std::string &filename) {
         if (!line.size()) continue;
         // node meta
         rg::split(line, '\t', tokens);
-        if (tokens.size() != 6) throw std::invalid_argument("Invalid node definition: " + line);
+        if (tokens.size() < 6) throw std::invalid_argument("Invalid node definition: " + line);
         const unsigned id = std::stoul(tokens[0]);
         _nodes->emplace(id, Graph::Node{});
         auto &n = _nodes->at(id);
@@ -199,6 +298,11 @@ void vargas::GraphMan::open(const std::string &filename) {
         n.set_af(std::stof(tokens[2]));
         if (tokens[3] == "1") n.pinch();
         if (tokens[4] == "1") n.set_as_ref();
+        // Optional 7th field: relevant-subset id -> attach the node's sequence membership bitvector.
+        if (tokens.size() >= 7) {
+            unsigned sid = std::stoul(tokens[6]);
+            if (sid < subset_table.size()) n.set_population(subset_table[sid]);
+        }
         const size_t seqsize = std::stoul(tokens[5]);
         std::vector<rg::Base> &seq = n.seq();
         seq.reserve(seqsize);
@@ -404,6 +508,47 @@ ACGTACGAC
         CHECK(p.second == 1);
     }
     remove(jfile.c_str());
+}
+
+TEST_CASE("Load/round-trip relevant-subset bitvectors") {
+    // Two nodes over a 3-sequence bit space: node 0 belongs to all three (dense 0x07), node 1
+    // only to sequence 0 (sparse). Exercises @seqids, @subsets (both encodings), the 7th node
+    // field, and a write->reload round-trip.
+    const std::string jfile = "tmp_subset.vgraph";
+    {
+        std::ofstream o(jfile);
+        o << "@vgraph\n\n@seqids\n0\ts0\n1\ts1\n2\ts2\n"
+          << "\n@contigs\n0\ttrie\n"
+          << "\n@subsets\n0\td:07\n1\ts:0\n"
+          << "\n@graphs\nbase\t0,1\t0:1;\n"
+          << "\n@nodes\n0\t1\t1\t0\t1\t2\t0\nAC\n1\t3\t0.3333\t0\t1\t2\t1\nGT\n";
+    }
+
+    auto check = [](vargas::GraphMan &gm) {
+        REQUIRE(gm.seqids().size() == 3);
+        CHECK(gm.seqids()[0] == "s0");
+        CHECK(gm.seqids()[2] == "s2");
+        auto it = gm.at("base")->begin();
+        CHECK(it->seq_str() == "AC");
+        CHECK(it->belongs(0u)); CHECK(it->belongs(1u)); CHECK(it->belongs(2u));
+        ++it;
+        CHECK(it->seq_str() == "GT");
+        CHECK(it->belongs(0u)); CHECK_FALSE(it->belongs(1u)); CHECK_FALSE(it->belongs(2u));
+    };
+
+    vargas::GraphMan gg;
+    gg.open(jfile);
+    check(gg);
+
+    const std::string jfile2 = "tmp_subset2.vgraph";   // write it back out and reload
+    gg.write(jfile2);
+    vargas::GraphMan gg2;
+    gg2.open(jfile2);
+    CHECK(gg2.seqids() == gg.seqids());
+    check(gg2);
+
+    remove(jfile.c_str());
+    remove(jfile2.c_str());
 }
 
 TEST_CASE("Write graph") {
