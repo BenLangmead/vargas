@@ -101,6 +101,7 @@ namespace vargas {
   struct Results {
       std::vector<pos_t> max_pos, sub_pos, max_last_pos, sub_last_pos, waiting_pos, waiting_last_pos;
       std::vector<unsigned> max_count, sub_count;
+      std::vector<unsigned> max_node; /**< Graph node id containing the max-scoring cell (for traceback) */
 
       std::vector<int> max_score; /**< Best scores */
       std::vector<int> sub_score; /**< Second best scores */
