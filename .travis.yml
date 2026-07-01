@@ -21,8 +21,6 @@ addons:
     - clang-3.7
 
 script:
-# Build htslib
-- cd htslib && autoheader && autoconf && ./configure && make && cd ../
 - mkdir build && cd build
 # Tests in debug and release build tests
 - cmake -DCMAKE_CXX_COMPILER=$COMPILER -DCMAKE_BUILD_TYPE=Debug ..
