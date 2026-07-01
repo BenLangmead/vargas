@@ -37,12 +37,38 @@ If a SAM read file is provided, `-s` can attempt to match a previous scoring fun
 
 ## Output
 
-Alignments are written as SAM files. Note CIGAR alignments are not provided. Fields relevant to Vargas are listed below.
+Alignments are written as SAM files. A `CIGAR` and `POS` are reported for the maximum-scoring
+alignment. For a linear reference the traceback is computed directly; for a variant graph the
+traceback is recomputed over a small window subgraph around the max-scoring position by
+enumerating that window's candidate paths (see `--max-trace-paths`) and keeping the best-scoring
+one. Pass `--notraceback` to skip CIGAR computation. Because the traceback needs the max-scoring
+position, a graph alignment must be run with `--maxonly` (not `--msonly`, which reports scores
+only). Fields relevant to Vargas are listed below.
 
-- `POS` Maximum scoring alignment, only known for end to end alignments.
+- `POS` Start position of the maximum-scoring alignment.
 - `RNAME` Maximum scoring sequence.
 - `FLAG` Reverse complement flag bit if aligned to opposite strand.
+- `CIGAR` Alignment of the maximum-scoring alignment (unless `--notraceback`).
 - `AS` Maximum score.
+- `vp` Nodes/alleles traversed by a graph alignment; non-reference alleles are marked with `*`.
+
+### Graph traceback limitations
+
+The graph traceback recovers the exact alignment by enumerating candidate paths through a local
+window and re-scoring each with the same affine DP used for linear references. It is exact for
+SNP-allele and reference alignments. In some cases the re-scored best path does not reach the
+SIMD-reported max score; a `[WARNING]` is printed and the best path found is still emitted as a
+valid (if slightly sub-optimal) CIGAR. Known cases:
+
+- **Reads shorter than the batch's longest read.** The SIMD scorer pads short reads and may score
+  the padding, so its `AS` can exceed the best score achievable by the true read.
+- **Ambiguous (`N`) bases.** The SIMD scorer and the traceback DP treat `N` differently.
+- **Insertion/deletion alleles.** When the optimal path runs through an indel allele, the
+  coordinate anchoring of parallel nodes can place the reported max position such that the true
+  end node is not reachable from the local window.
+
+Recovering these exactly requires a full partial-order (graph) DP with per-node traceback, which
+is future work.
 - `mp` Position of the maximum scoring cell.
 - `ss` Second best score.
 - `st` Strand of second best score.
