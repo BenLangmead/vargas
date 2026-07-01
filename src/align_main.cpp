@@ -984,3 +984,53 @@ TEST_CASE ("Graph traceback SNP bubble") {
         CHECK_FALSE(r.ok);
     }
 }
+
+TEST_CASE ("Graph traceback trie (varying-length sibling branches)") {
+    // A path-compressed reverse-suffix trie: a shared trunk "AC" that branches into siblings of
+    // DIFFERENT lengths -- "GTA" (leaf, spells ACGTA) and "TT" (leaf, spells ACTT). Unlike a SNP
+    // bubble, the sibling end nodes do NOT share an end coordinate, which is the topology produced
+    // by build_trie.py. Verifies that graph_traceback recovers the correct branch/CIGAR anyway.
+    auto g = std::make_shared<vargas::Graph>();
+    auto mknode = [](unsigned id, const std::string &s, unsigned endp, bool ref) {
+        vargas::Graph::Node n;
+        n.set_id(id); n.set_seq(s); n.set_endpos(endp); n.set_pinch(false);
+        if (ref) n.set_as_ref(); else n.set_not_ref();
+        n.set_population(1, ref);
+        return n;
+    };
+    g->add_node(mknode(0, "AC",  1, true));   // trunk, pos 0..1
+    g->add_node(mknode(1, "GTA", 4, false));  // long branch, pos 2..4  (leaf ACGTA)
+    g->add_node(mknode(2, "TT",  3, false));  // short branch, pos 2..3 (leaf ACTT)
+    g->add_edge(0, 1); g->add_edge(0, 2);
+
+    vargas::GraphMan gm;                       // empty resolver: absolute_position(p) == {"", p}
+    vargas::ScoreProfile loc(2u, 6u, 3u, 1u);  // local, match 2 / mismatch 6 / gap 3,1
+    loc.end_to_end = false;
+
+    SUBCASE("long branch") {
+        // ACGTA, max cell at end of node 1 (pos 4 -> 1-based 5), score 5*2=10.
+        auto r = graph_traceback(gm, g, 5, 10, "ACGTA", "", 33, loc, 256);
+        CHECK(r.ok);
+        CHECK(r.cigar == "5M");
+        CHECK(r.path == "0,1*");
+        CHECK(r.start_pos == 1);
+    }
+    SUBCASE("short branch (max cell also lies within the long sibling's range)") {
+        // ACTT, max cell at end of node 2 (pos 3 -> 1-based 4), score 4*2=8. pos0=3 also falls
+        // inside node 1 (range 2..4), so node 1 is a candidate end too; the re-scoring must still
+        // prefer the exact short-branch path.
+        auto r = graph_traceback(gm, g, 4, 8, "ACTT", "", 33, loc, 256);
+        CHECK(r.ok);
+        CHECK(r.cigar == "4M");
+        CHECK(r.path == "0,2*");
+        CHECK(r.start_pos == 1);
+    }
+    SUBCASE("read starting mid-trunk") {
+        // CGTA: a substring of ACGTA starting inside the trunk; ends at node 1 (pos 4). Local
+        // alignment recovers the 4-base match starting at trunk offset 1 (global pos 2 -> 1-based).
+        auto r = graph_traceback(gm, g, 5, 8, "CGTA", "", 33, loc, 256);
+        CHECK(r.ok);
+        CHECK(r.cigar == "4M");
+        CHECK(r.start_pos == 2);
+    }
+}
