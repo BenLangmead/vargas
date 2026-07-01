@@ -66,8 +66,16 @@ namespace vargas {
    * vcf <vcf file name>
    * [other meta info]
    *
+   * @seqids                (optional) global sequence-id -> bit-position map; index == position
+   * <bit index> <sequence id>
+   * ...
+   *
    * @contigs
    * <offset> <contig name>
+   * ...
+   *
+   * @subsets               (optional) de-duplicated relevant-subset bitvectors over the @seqids
+   * <subset id> <s:pos,pos,...  |  d:little-endian-hex>
    * ...
    *
    * @graphs
@@ -75,11 +83,14 @@ namespace vargas {
    * ...
    *
    * @nodes
-   * <ID> <endpos> <frequency> <pinched> <ref> <seqsize>
+   * <ID> <endpos> <frequency> <pinched> <ref> <seqsize> [<subset id>]
    * <node sequence>
    * ...
    *
    * @endcode
+   * The @seqids/@subsets sections and the trailing node subset id are optional; files without
+   * them still load. When present, each node's Population bitvector records which reference
+   * sequences pass through it, so an alignment ending at a node maps to that subset of sequences.
    */
   class GraphMan {
     public:
@@ -145,6 +156,14 @@ namespace vargas {
           return _resolver;
       }
 
+      /**
+       * @return Global sequence-id -> bit-position mapping (from the .gdef @seqids section);
+       *         empty if the graph carries no per-node relevant-subset bitvectors.
+       */
+      const std::vector<std::string> &seqids() const {
+          return _seqids;
+      }
+
       size_t count(const std::string& label) const {
           return _graphs.count(label);
       }
@@ -204,6 +223,7 @@ namespace vargas {
       std::map<std::string, std::shared_ptr<vargas::Graph>> _graphs; // Map label to a graph
       coordinate_resolver _resolver;
       std::map<std::string, std::string> _aux;
+      std::vector<std::string> _seqids;   // global sequence-id -> bit index (index == position)
       bool _assume_contig = false;
       bool _print = false;
   };
