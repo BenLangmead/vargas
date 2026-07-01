@@ -55,6 +55,13 @@ int align_main(int argc, char *argv[]);
 
 /**
  * @brief
+ * Which traceback specialization to use. AUTO picks by graph structure; LINEAR/TRIE force a
+ * specialization and error out if the graph is not that structure; GRAPH forces the general path.
+ */
+enum class TracebackMode { AUTO, LINEAR, TRIE, GRAPH };
+
+/**
+ * @brief
  * Align tasks to their graphs.
  * @param gm GraphMan hosting target graphs
  * @param task_list Parallel execution tasks
@@ -67,12 +74,14 @@ int align_main(int argc, char *argv[]);
  * @param notraceback
  * @param phred_offset
  * @param max_paths max candidate paths per read when tracing back through a variant-graph window
+ * @param tb_mode traceback specialization selection (auto/linear/trie/graph)
  */
 void align(vargas::GraphMan &gm,
            std::vector<std::pair<std::string, std::vector<vargas::SAM::Record>>> &task_list,
            vargas::osam &out,
            const std::vector<std::unique_ptr<vargas::AlignerBase, rg::Deleter>> &aligners,
-           bool fwdonly, bool msonly, bool maxonly, bool notraceback, char phred_offset, unsigned max_paths);
+           bool fwdonly, bool msonly, bool maxonly, bool notraceback, char phred_offset,
+           unsigned max_paths, TracebackMode tb_mode);
 
 /**
  * @brief

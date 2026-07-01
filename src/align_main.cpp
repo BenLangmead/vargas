@@ -35,7 +35,7 @@ int align_main(int argc, char *argv[]) {
 
     // Load parameters
     unsigned match, npenalty, threads, chunk_size, subsample, max_paths;
-    std::string read_file, gdf, align_targets, out_file, pgid, mismatch, rdg, rfg;
+    std::string read_file, gdf, align_targets, out_file, pgid, mismatch, rdg, rfg, traceback_opt;
     bool end_to_end = false, fwdonly = false, p64=false, msonly=false, maxonly=false, notraceback=false;
 
     cxxopts::Options opts("vargas align", "Align reads to a graph.");
@@ -54,6 +54,7 @@ int align_main(int argc, char *argv[]) {
         ("s,assess", "[ID] Use score profile from a previous alignment.", cxxopts::value(pgid)->implicit_value("."))
         ("f,forward", "Only align to forward strand.", cxxopts::value(fwdonly))
         ("notraceback", "Do not compute traceback (CIGAR).", cxxopts::value(notraceback)->implicit_value("1"))
+        ("traceback", "<auto|linear|trie|graph> Traceback specialization; forced modes error if the graph is not that structure.", cxxopts::value(traceback_opt)->default_value("auto"))
         ("max-trace-paths", "<N> Max candidate paths per read when tracing back through a variant graph window.", cxxopts::value(max_paths)->default_value("256"));
 
         opts.add_options("Scoring")
@@ -225,7 +226,16 @@ int align_main(int argc, char *argv[]) {
     reads_hdr.programs[assigned_pgid].aux.set(ALIGN_SAM_PG_GDF, gdf);
     vargas::osam aligns_out(out_file, reads_hdr);
     char phred_offset = opts.count("phred64") ? 64 : 33;
-    align(gm, task_list, aligns_out, aligners, fwdonly, msonly, maxonly, notraceback, phred_offset, max_paths);
+
+    TracebackMode tb_mode;
+    if (traceback_opt == "auto") tb_mode = TracebackMode::AUTO;
+    else if (traceback_opt == "linear") tb_mode = TracebackMode::LINEAR;
+    else if (traceback_opt == "trie") tb_mode = TracebackMode::TRIE;
+    else if (traceback_opt == "graph") tb_mode = TracebackMode::GRAPH;
+    else throw std::invalid_argument("--traceback must be one of: auto, linear, trie, graph");
+
+    align(gm, task_list, aligns_out, aligners, fwdonly, msonly, maxonly, notraceback, phred_offset,
+          max_paths, tb_mode);
 
     return 0;
 }
@@ -411,12 +421,115 @@ struct GraphTraceResult {
 
 /**
  * @brief
- * Recover the full alignment (CIGAR + start position + traversed alleles) through a variant
- * graph, by recomputing the traceback in a small window subgraph around the max-scoring end
- * position. Each source->sink path through the window is flattened to a linear reference and
- * scored with flat_traceback(); the path whose DP score matches the SIMD max score is kept.
+ * Flatten one source->end node path to a linear reference and score the read against it.
+ * The end node is truncated at end_off (the max-scoring cell), and only the last L reference
+ * bases are kept (upstream context is bounded). Shared by the trie/ancestor and general-graph
+ * tracebacks so both reconstruct CIGAR / start position / path tag identically.
+ * @param subgraph aligned-to subgraph (for node sequences)
+ * @param gm GraphMan (for reference-coordinate mapping)
+ * @param cur node ids along the path, source first, ending at term
+ * @param term the end node id (its sequence is truncated at end_off+1)
+ * @param end_off offset of the max cell within the end node
+ * @param L keep only the last L reference bases of the flattened path
+ * @return traceback for this single path (score == INT_MIN if the slice was empty)
+ */
+static GraphTraceResult score_flat_path(const vargas::GraphMan &gm,
+                                        const std::shared_ptr<vargas::Graph> &subgraph,
+                                        const std::vector<unsigned> &cur,
+                                        unsigned term, int end_off, int L,
+                                        const std::string &read, const std::string &qual,
+                                        char phred_offset, const vargas::ScoreProfile &prof,
+                                        int max_score) {
+    const auto &nmap = *subgraph->node_map();
+    GraphTraceResult r;
+    std::vector<rg::Base> slice;
+    std::vector<std::pair<unsigned, int>> prov;   // (node_id, node_offset) per reference base
+    for (unsigned nid : cur) {
+        const auto &seq = nmap.at(nid).seq();
+        int upto = (nid == term) ? std::min<int>(end_off + 1, (int)seq.size()) : (int)seq.size();
+        for (int o = 0; o < upto; ++o) { slice.push_back(seq[o]); prov.emplace_back(nid, o); }
+    }
+    if ((int)slice.size() > L) {                  // bound upstream context
+        int drop = (int)slice.size() - L;
+        slice.erase(slice.begin(), slice.begin() + drop);
+        prov.erase(prov.begin(), prov.begin() + drop);
+    }
+    if (slice.empty()) return r;                  // r.score stays INT_MIN
+    FlatTraceResult tr = flat_traceback(slice, read, qual, phred_offset, prof);
+    int off = std::min<int>(std::max(tr.ref_offset, 0), (int)prov.size() - 1);
+    auto pr = prov[off];
+    unsigned gstart0 = nmap.at(pr.first).begin_pos() + pr.second;   // 0-based global start
+    r.start_pos = gm.absolute_position(gstart0 + 1).second;
+    std::string ptag;                              // node ids over the aligned span [off, end)
+    unsigned prevn = std::numeric_limits<unsigned>::max();
+    for (int q = off; q < (int)prov.size(); ++q) {
+        unsigned nid = prov[q].first;
+        if (nid != prevn) {
+            if (!ptag.empty()) ptag.push_back(',');
+            ptag += std::to_string(nid);
+            if (!nmap.at(nid).is_ref()) ptag.push_back('*');
+            prevn = nid;
+        }
+    }
+    r.ok = (tr.score == max_score);
+    r.cigar = tr.cigar; r.score = tr.score; r.path = ptag;
+    return r;
+}
+
+/**
+ * @brief
+ * Traceback for a linear reference or a trie/forest (every node has in-degree <= 1). Because the
+ * SIMD scorer now records the exact end node of the max cell, and each node has a unique parent,
+ * the read's alignment lies entirely on the end node's ancestor chain -- so there is no search:
+ * walk parents to gather ~2*readlen upstream bases, flatten, and run one linear traceback. The
+ * linear single-node case falls out as a chain of length one.
+ * @param end_node node id containing the max-scoring cell (Results::max_node)
+ * @param max_pos_global SIMD max-scoring position, 1-based global coordinate
+ * @param max_score SIMD optimal score
+ */
+static GraphTraceResult ancestral_traceback(const vargas::GraphMan &gm,
+                                            const std::shared_ptr<vargas::Graph> &subgraph,
+                                            unsigned end_node,
+                                            unsigned max_pos_global,
+                                            int max_score,
+                                            const std::string &read,
+                                            const std::string &qual,
+                                            char phred_offset,
+                                            const vargas::ScoreProfile &prof) {
+    const auto &nmap = *subgraph->node_map();
+    const auto &prevm = subgraph->prev_map();
+    const int read_len = static_cast<int>(read.length());
+    int L = 2 * read_len; if (L <= 0) L = 1;
+
+    const auto &en = nmap.at(end_node);
+    int end_off = static_cast<int>(max_pos_global - 1) - static_cast<int>(en.begin_pos());
+    end_off = std::min<int>(std::max(end_off, 0), (int)en.length() - 1);
+
+    // Walk the unique parent chain until we've covered L upstream bases or reached a source.
+    std::vector<unsigned> chain{end_node};
+    int covered = end_off + 1;
+    unsigned cur = end_node;
+    while (covered < L) {
+        auto it = prevm.find(cur);
+        if (it == prevm.end() || it->second.size() != 1) break;   // source, or (defensively) a join
+        cur = it->second[0];
+        chain.insert(chain.begin(), cur);
+        covered += static_cast<int>(nmap.at(cur).length());
+    }
+    return score_flat_path(gm, subgraph, chain, end_node, end_off, L, read, qual, phred_offset,
+                           prof, max_score);
+}
+
+/**
+ * @brief
+ * Recover the full alignment (CIGAR + start position + traversed alleles) through a general
+ * (possibly re-convergent) variant graph. The SIMD scorer records the exact end node of the max
+ * cell, so the endpoint is known directly; a small window subgraph upstream of it is built, and
+ * each source->end path is flattened to a linear reference and scored with flat_traceback(),
+ * keeping the best. (For an in-degree<=1 graph, prefer ancestral_traceback -- no enumeration.)
  * @param gm GraphMan (for reference-coordinate mapping)
  * @param subgraph aligned-to subgraph
+ * @param end_node node id of the max-scoring cell (Results::max_node)
  * @param max_pos_global SIMD max-scoring position, 1-based global coordinate (aligns.max_pos[j])
  * @param max_score SIMD optimal score (ground truth over the whole graph)
  * @param read read sequence (already reverse-complemented if aligned to the reverse strand)
@@ -428,6 +541,7 @@ struct GraphTraceResult {
  */
 static GraphTraceResult graph_traceback(const vargas::GraphMan &gm,
                                         const std::shared_ptr<vargas::Graph> &subgraph,
+                                        unsigned end_node,
                                         unsigned max_pos_global,
                                         int max_score,
                                         const std::string &read,
@@ -446,33 +560,16 @@ static GraphTraceResult graph_traceback(const vargas::GraphMan &gm,
         auto it = nextm.find(id); return it == nextm.end() ? empty_edges : it->second;
     };
 
-    // Candidate end nodes: every node whose coordinate range contains the max-cell position.
-    // seek() returns one such node, but parallel alt alleles are anchored to the SAME end
-    // coordinate, so the max cell may lie in a sibling of seek()'s node. Collect those siblings
-    // (they share a predecessor or successor with the seeded node).
+    // The scorer recorded the exact node the max cell was in, so the end node is known directly
+    // (no coordinate->node guessing). Only the upstream side can branch on a re-convergent graph,
+    // which the window enumeration below handles.
     const unsigned pos0 = max_pos_global - 1;   // 0-based coordinate of the max cell
-    auto contains = [&](unsigned id) {
-        const auto &n = nmap.at(id);
-        return n.begin_pos() <= pos0 && pos0 <= n.end_pos();
-    };
-    std::unordered_set<unsigned> ends;
+    std::unordered_set<unsigned> ends{end_node};
     std::unordered_map<unsigned, int> endOff;   // end node -> offset of max cell within it
-    auto add_end = [&](unsigned id) {
-        if (contains(id) && ends.insert(id).second) endOff[id] = static_cast<int>(pos0 - nmap.at(id).begin_pos());
-    };
-    const unsigned e_seed = subgraph->seek(max_pos_global).first->id();
-    add_end(e_seed);
-    // Consider one-hop neighbours that also cover the coordinate. This captures (a) parallel alt
-    // alleles that share a predecessor/successor with the seeded node, and (b) insertion alleles,
-    // which are successors anchored to the same end coordinate and therefore still contain pos0.
-    for (unsigned p : preds(e_seed)) { add_end(p); for (unsigned c : succs(p)) add_end(c); }
-    for (unsigned s : succs(e_seed)) { add_end(s); for (unsigned c : preds(s)) add_end(c); }
-    if (ends.empty()) {                          // fallback: coordinate edge case, use seek's node
-        const auto &n = nmap.at(e_seed);
-        int off = (pos0 >= n.begin_pos()) ? std::min<int>((int)(pos0 - n.begin_pos()), (int)n.length() - 1)
-                                          : (int)n.length() - 1;
-        ends.insert(e_seed);
-        endOff[e_seed] = std::max(off, 0);
+    {
+        const auto &n = nmap.at(end_node);
+        int off = static_cast<int>(pos0) - static_cast<int>(n.begin_pos());
+        endOff[end_node] = std::min<int>(std::max(off, 0), (int)n.length() - 1);
     }
 
     const int read_len = static_cast<int>(read.length());
@@ -512,47 +609,12 @@ static GraphTraceResult graph_traceback(const vargas::GraphMan &gm,
             if (capped) return;
             cur.push_back(id);
             if (ends.count(id)) {
-                // Flatten cur -> slice + per-base provenance, truncating the end node at its offset.
-                const unsigned term = id;
-                std::vector<rg::Base> slice;
-                std::vector<std::pair<unsigned, int>> prov; // (node_id, node_offset) per base
-                for (unsigned nid : cur) {
-                    const auto &seq = nmap.at(nid).seq();
-                    int upto = (nid == term) ? std::min<int>(endOff[term] + 1, (int)seq.size()) : (int)seq.size();
-                    for (int o = 0; o < upto; ++o) { slice.push_back(seq[o]); prov.emplace_back(nid, o); }
-                }
-                // Keep only the last L bases (upstream context is bounded).
-                if ((int)slice.size() > L) {
-                    int drop = (int)slice.size() - L;
-                    slice.erase(slice.begin(), slice.begin() + drop);
-                    prov.erase(prov.begin(), prov.begin() + drop);
-                }
-                if (!slice.empty()) {
-                    FlatTraceResult tr = flat_traceback(slice, read, qual, phred_offset, prof);
-                    int gap = std::abs(tr.score - max_score);
-                    if (gap < bestGap) {
-                        bestGap = gap;
-                        int off = std::min<int>(std::max(tr.ref_offset, 0), (int)prov.size() - 1);
-                        auto pr = prov[off];
-                        unsigned gstart0 = nmap.at(pr.first).begin_pos() + pr.second; // 0-based global
-                        best.start_pos = gm.absolute_position(gstart0 + 1).second;
-                        // Build the path tag from the aligned span [off, end).
-                        std::string ptag;
-                        unsigned prevn = std::numeric_limits<unsigned>::max();
-                        for (int q = off; q < (int)prov.size(); ++q) {
-                            unsigned nid = prov[q].first;
-                            if (nid != prevn) {
-                                if (!ptag.empty()) ptag.push_back(',');
-                                ptag += std::to_string(nid);
-                                if (!nmap.at(nid).is_ref()) ptag.push_back('*');
-                                prevn = nid;
-                            }
-                        }
-                        best.ok = (gap == 0);
-                        best.cigar = tr.cigar;
-                        best.score = tr.score;
-                        best.path = ptag;
-                    }
+                GraphTraceResult r = score_flat_path(gm, subgraph, cur, id, endOff.at(id), L,
+                                                     read, qual, phred_offset, prof, max_score);
+                int gap = std::abs(r.score - max_score);
+                if (r.score != std::numeric_limits<int>::min() && gap < bestGap) {
+                    bestGap = gap;
+                    best = r;
                 }
                 if (++path_count > max_paths) capped = true;
             } else {
@@ -573,6 +635,16 @@ static GraphTraceResult graph_traceback(const vargas::GraphMan &gm,
     return best;                    // best effort (score may differ; caller warns)
 }
 
+// A graph is a "forest" (every node has in-degree <= 1) iff no node has more than one predecessor.
+// Then each node's ancestor chain is unique, so ancestral_traceback needs no search. A linear
+// reference (no edges) is a degenerate forest. Reports an offending node via *bad when false.
+static bool graph_is_forest(const std::shared_ptr<vargas::Graph> &g, unsigned *bad = nullptr) {
+    for (const auto &kv : g->prev_map()) {
+        if (kv.second.size() > 1) { if (bad) *bad = kv.first; return false; }
+    }
+    return true;
+}
+
 struct align_helper {
     vargas::GraphMan &gm;
     std::vector<std::pair<std::string, std::vector<vargas::SAM::Record>>> &task_list;
@@ -581,6 +653,9 @@ struct align_helper {
     bool fwdonly, msonly, maxonly, notraceback;
     char phred_offset;
     unsigned max_paths;
+    // Per-subgraph-label traceback strategy, resolved+validated once before threads start.
+    const std::unordered_map<std::string, bool> &use_ancestral;  // ancestor-chain vs general window
+    const std::unordered_map<std::string, bool> &is_linear;      // single node per contig
     std::mutex &mut;
 };
 
@@ -610,12 +685,14 @@ void align_helper_func(void *data, long index, int tid) {
                            [](char c){ return c - 33; }); //TODO needs to be offset variable
         }
     }
-    auto subgraph = gm.at(task_list.at(index).first);
+    const std::string &label = task_list.at(index).first;
+    auto subgraph = gm.at(label);
     vargas::Results aligns;
     aligners[tid]->align_into(read_seqs, quals, subgraph->begin(), subgraph->end(), aligns, fwdonly);
 
-    //If no variants (# nodes == # contigs) compute the alignment traceback
-    bool not_graph = subgraph->node_map()->size() == gm.resolver()._contig_hdr_order.size();
+    // Traceback strategy for this subgraph, resolved+validated up front in align().
+    const bool use_ancestral = help.use_ancestral.at(label);
+    const bool is_linear = help.is_linear.at(label);
 
     for (size_t j = 0; j < task_list.at(index).second.size(); ++j) {
         vargas::SAM::Record &rec = task_list.at(index).second.at(j);
@@ -635,27 +712,25 @@ void align_helper_func(void *data, long index, int tid) {
             rec.aux.set(ALIGN_SAM_MAX_COUNT_TAG, aligns.max_count[j]);
 
             if (!notraceback) {
-                if (not_graph) {
-                    // Fast path: a linear reference. Slice a flat window and trace back.
-                    int nodeID = gm.nodeID_from_contig(rec.ref_name);
-                    vargas::Graph::nodemap_t _node_map = *(subgraph->node_map());
-                    //TODO upper-bound the length of reference slice needed based on the score or scoring function
-                    int ref_len = 2*rec.seq.length() < abs.second ? 2*rec.seq.length() : abs.second ;
-                    int ref_start = abs.second-ref_len;
-                    auto ref_iter = std::next(_node_map[nodeID].begin(),ref_start); //TODO this is linear time I think?
-                    std::vector<rg::Base> ref_slice(ref_iter, std::next(ref_iter, ref_len));
-
-                    FlatTraceResult tr = flat_traceback(ref_slice, rec.seq, rec.qual, phred_offset, aligns.profile);
-                    if (tr.score != aligns.max_score[j]) {
-                        std::cerr << "[WARNING] " << rec.query_name << " DP optimal score " << tr.score
+                if (use_ancestral) {
+                    // Linear reference or trie/forest: the recorded end node's unique ancestor chain
+                    // is the reference, so no search is needed.
+                    GraphTraceResult gt = ancestral_traceback(gm, subgraph, aligns.max_node[j],
+                                                              aligns.max_pos[j], aligns.max_score[j],
+                                                              rec.seq, rec.qual, phred_offset, aligns.profile);
+                    if (!gt.ok) {
+                        std::cerr << "[WARNING] " << rec.query_name << " ancestral DP score " << gt.score
                                   << " and SIMD optimal score " << aligns.max_score[j] << " not equal\n";
                     }
-                    rec.pos = abs.second - ref_len + tr.ref_offset;
-                    rec.cigar = tr.cigar;
+                    rec.pos = gt.start_pos;
+                    rec.cigar = gt.cigar;
+                    if (!is_linear) rec.aux.set(ALIGN_SAM_PATH_TAG, gt.path);  // vp only for real graphs
                 } else {
-                    // Variant graph: recompute the traceback over a window subgraph.
-                    GraphTraceResult gt = graph_traceback(gm, subgraph, aligns.max_pos[j], aligns.max_score[j],
-                                                          rec.seq, rec.qual, phred_offset, aligns.profile, max_paths);
+                    // General (re-convergent) graph: recompute the traceback over a window subgraph,
+                    // seeded with the exact recorded end node.
+                    GraphTraceResult gt = graph_traceback(gm, subgraph, aligns.max_node[j], aligns.max_pos[j],
+                                                          aligns.max_score[j], rec.seq, rec.qual, phred_offset,
+                                                          aligns.profile, max_paths);
                     if (gt.path == "capped") {
                         std::cerr << "[WARNING] " << rec.query_name << " too many candidate paths (> "
                                   << max_paths << "); skipping CIGAR. Increase --max-trace-paths.\n";
@@ -689,6 +764,51 @@ void align_helper_func(void *data, long index, int tid) {
     }
 }
 
+/**
+ * @brief
+ * Resolve, once and single-threaded, the traceback strategy for each distinct subgraph label used
+ * by the tasks, and validate the requested mode against the actual graph structure (throws with a
+ * clear message on mismatch). Populates use_ancestral (ancestor-chain vs general window) and
+ * is_linear (single node per contig) keyed by label. Must be defined before `#define at operator[]`.
+ */
+static void resolve_strategies(vargas::GraphMan &gm,
+                               const std::vector<std::pair<std::string, std::vector<vargas::SAM::Record>>> &task_list,
+                               TracebackMode tb_mode,
+                               std::unordered_map<std::string, bool> &use_ancestral,
+                               std::unordered_map<std::string, bool> &is_linear) {
+    const size_t n_contigs = gm.resolver()._contig_hdr_order.size();
+    for (const auto &t : task_list) {
+        const std::string &label = t.first;
+        if (use_ancestral.count(label)) continue;
+        auto sg = gm.at(label);
+        const bool lin = sg->node_map()->size() == n_contigs;   // one node per contig => linear
+        unsigned bad = 0;
+        const bool forest = graph_is_forest(sg, &bad);
+        switch (tb_mode) {
+            case TracebackMode::LINEAR:
+                if (!lin) throw std::invalid_argument(
+                    "--traceback=linear but graph \"" + label + "\" is not a single node per contig");
+                break;
+            case TracebackMode::TRIE:
+                if (!forest) throw std::invalid_argument(
+                    "--traceback=trie but graph \"" + label + "\" is not a forest: node "
+                    + std::to_string(bad) + " has multiple predecessors");
+                break;
+            default: break;
+        }
+        bool anc;
+        switch (tb_mode) {
+            case TracebackMode::AUTO:   anc = forest; break;    // linear is a subset of forest
+            case TracebackMode::LINEAR: anc = true;   break;
+            case TracebackMode::TRIE:   anc = true;   break;
+            case TracebackMode::GRAPH:  anc = false;  break;
+            default:                    anc = forest; break;
+        }
+        use_ancestral[label] = anc;
+        is_linear[label] = lin;
+    }
+}
+
 #if !NDEBUG
 #else
 #define at operator[]
@@ -698,14 +818,20 @@ void align(vargas::GraphMan &gm,
            std::vector<std::pair<std::string, std::vector<vargas::SAM::Record>>> &task_list,
            vargas::osam &out,
            const std::vector<std::unique_ptr<vargas::AlignerBase, rg::Deleter>> &aligners,
-           bool fwdonly, bool msonly, bool maxonly, bool notraceback, char phred_offset, unsigned max_paths) {
+           bool fwdonly, bool msonly, bool maxonly, bool notraceback, char phred_offset,
+           unsigned max_paths, TracebackMode tb_mode) {
+    // Resolve + validate the traceback strategy per subgraph before spawning threads (fails fast).
+    std::unordered_map<std::string, bool> use_ancestral, is_linear;
+    resolve_strategies(gm, task_list, tb_mode, use_ancestral, is_linear);
+
     std::cerr << "Aligning... " << std::flush;
     rg::ForPool fp(aligners.size());
     auto start_time = std::chrono::steady_clock::now();
 
     const auto num_tasks = task_list.size();
     std::mutex mut;
-    align_helper help{gm, task_list, out, aligners, fwdonly, msonly, maxonly, notraceback, phred_offset, max_paths, mut};
+    align_helper help{gm, task_list, out, aligners, fwdonly, msonly, maxonly, notraceback,
+                      phred_offset, max_paths, use_ancestral, is_linear, mut};
     fp.forpool(&align_helper_func, (void *)&help, num_tasks);
 
     std::cerr << rg::chrono_duration(start_time) << "s.\n";
@@ -965,21 +1091,24 @@ TEST_CASE ("Graph traceback SNP bubble") {
     vargas::ScoreProfile loc(2u, 6u, 3u, 1u);  // local, match 2 / mismatch 6 / gap 3,1
     loc.end_to_end = false;
 
+    CHECK_FALSE(graph_is_forest(g));   // node 3 has two predecessors -> general graph, not a forest
+
+    // The scorer supplies the exact end node (here node 3, the shared TTT) via Results::max_node.
     SUBCASE("prefers alt allele") {
-        auto r = graph_traceback(gm, g, /*max_pos=*/7, /*max_score=*/14, "AACGTTT", "", 33, loc, 256);
+        auto r = graph_traceback(gm, g, /*end_node=*/3, /*max_pos=*/7, /*max_score=*/14, "AACGTTT", "", 33, loc, 256);
         CHECK(r.ok);
         CHECK(r.cigar == "7M");
         CHECK(r.path == "0,1*,3");   // alt node 1 marked with '*'
         CHECK(r.start_pos == 1);
     }
     SUBCASE("prefers ref allele") {
-        auto r = graph_traceback(gm, g, 7, 14, "AACCTTT", "", 33, loc, 256);
+        auto r = graph_traceback(gm, g, 3, 7, 14, "AACCTTT", "", 33, loc, 256);
         CHECK(r.ok);
         CHECK(r.cigar == "7M");
         CHECK(r.path == "0,2,3");
     }
     SUBCASE("path cap bails") {
-        auto r = graph_traceback(gm, g, 7, 14, "AACGTTT", "", 33, loc, 1);
+        auto r = graph_traceback(gm, g, 3, 7, 14, "AACGTTT", "", 33, loc, 1);
         CHECK(r.path == "capped");
         CHECK_FALSE(r.ok);
     }
@@ -987,9 +1116,9 @@ TEST_CASE ("Graph traceback SNP bubble") {
 
 TEST_CASE ("Graph traceback trie (varying-length sibling branches)") {
     // A path-compressed reverse-suffix trie: a shared trunk "AC" that branches into siblings of
-    // DIFFERENT lengths -- "GTA" (leaf, spells ACGTA) and "TT" (leaf, spells ACTT). Unlike a SNP
-    // bubble, the sibling end nodes do NOT share an end coordinate, which is the topology produced
-    // by build_trie.py. Verifies that graph_traceback recovers the correct branch/CIGAR anyway.
+    // DIFFERENT lengths -- "GTA" (leaf, spells ACGTA) and "TT" (leaf, spells ACTT). Every node has
+    // in-degree <= 1, so ancestral_traceback reconstructs the exact path from the recorded end node
+    // by walking its unique parent chain -- no coordinate->node guessing.
     auto g = std::make_shared<vargas::Graph>();
     auto mknode = [](unsigned id, const std::string &s, unsigned endp, bool ref) {
         vargas::Graph::Node n;
@@ -1007,19 +1136,20 @@ TEST_CASE ("Graph traceback trie (varying-length sibling branches)") {
     vargas::ScoreProfile loc(2u, 6u, 3u, 1u);  // local, match 2 / mismatch 6 / gap 3,1
     loc.end_to_end = false;
 
+    CHECK(graph_is_forest(g));                 // in-degree <= 1 everywhere -> ancestral path applies
+
     SUBCASE("long branch") {
-        // ACGTA, max cell at end of node 1 (pos 4 -> 1-based 5), score 5*2=10.
-        auto r = graph_traceback(gm, g, 5, 10, "ACGTA", "", 33, loc, 256);
+        // ACGTA, end node 1 (pos 4 -> 1-based 5), score 5*2=10.
+        auto r = ancestral_traceback(gm, g, /*end_node=*/1, /*max_pos=*/5, /*max_score=*/10, "ACGTA", "", 33, loc);
         CHECK(r.ok);
         CHECK(r.cigar == "5M");
         CHECK(r.path == "0,1*");
         CHECK(r.start_pos == 1);
     }
-    SUBCASE("short branch (max cell also lies within the long sibling's range)") {
-        // ACTT, max cell at end of node 2 (pos 3 -> 1-based 4), score 4*2=8. pos0=3 also falls
-        // inside node 1 (range 2..4), so node 1 is a candidate end too; the re-scoring must still
-        // prefer the exact short-branch path.
-        auto r = graph_traceback(gm, g, 4, 8, "ACTT", "", 33, loc, 256);
+    SUBCASE("short branch (varying-length sibling)") {
+        // ACTT, end node 2 (pos 3 -> 1-based 4), score 4*2=8. The end node is known, so the short
+        // branch is reconstructed directly even though node 1's range also covers coordinate 3.
+        auto r = ancestral_traceback(gm, g, 2, 4, 8, "ACTT", "", 33, loc);
         CHECK(r.ok);
         CHECK(r.cigar == "4M");
         CHECK(r.path == "0,2*");
@@ -1028,9 +1158,29 @@ TEST_CASE ("Graph traceback trie (varying-length sibling branches)") {
     SUBCASE("read starting mid-trunk") {
         // CGTA: a substring of ACGTA starting inside the trunk; ends at node 1 (pos 4). Local
         // alignment recovers the 4-base match starting at trunk offset 1 (global pos 2 -> 1-based).
-        auto r = graph_traceback(gm, g, 5, 8, "CGTA", "", 33, loc, 256);
+        auto r = ancestral_traceback(gm, g, 1, 5, 8, "CGTA", "", 33, loc);
         CHECK(r.ok);
         CHECK(r.cigar == "4M");
         CHECK(r.start_pos == 2);
     }
+}
+
+TEST_CASE ("Ancestral traceback linear single node") {
+    // A linear reference is a degenerate forest (a one-node ancestor chain).
+    auto g = std::make_shared<vargas::Graph>();
+    vargas::Graph::Node n;
+    n.set_id(0); n.set_seq("ACGTACGT"); n.set_endpos(7); n.set_pinch(false);
+    n.set_as_ref(); n.set_population(1, true);
+    g->add_node(n);
+
+    vargas::GraphMan gm;
+    vargas::ScoreProfile loc(2u, 6u, 3u, 1u);
+    loc.end_to_end = false;
+
+    CHECK(graph_is_forest(g));
+    // read "CGTA" matches ref[1..4]; ends at pos 4 -> 1-based 5.
+    auto r = ancestral_traceback(gm, g, /*end_node=*/0, /*max_pos=*/5, /*max_score=*/8, "CGTA", "", 33, loc);
+    CHECK(r.ok);
+    CHECK(r.cigar == "4M");
+    CHECK(r.start_pos == 2);
 }

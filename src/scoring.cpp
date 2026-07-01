@@ -29,6 +29,7 @@ std::string vargas::ScoreProfile::to_string() const {
 void vargas::Results::resize(size_t size) {
     max_pos.resize(size);
     sub_pos.resize(size);
+    max_node.resize(size);
     max_count.resize(size);
     sub_count.resize(size);
     max_score.resize(size);

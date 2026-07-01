@@ -407,6 +407,7 @@ namespace vargas {
                   _max_pos = aligns.max_pos.data() + beg_offset;
                   _max_last_pos = aligns.max_last_pos.data() + beg_offset;
                   _max_count = aligns.max_count.data() + beg_offset;
+                  _max_node = aligns.max_node.data() + beg_offset;
               }
 
               if (!MAXONLY) {
@@ -583,6 +584,7 @@ namespace vargas {
           #endif
 
           unsigned curr_pos = n.end_pos() - n.seq().size() + 2;
+          _curr_node_id = n.id();   // recorded alongside the max cell's position (see _fill_cell_finish)
 
           _S = s.S_col;
           _Ic = s.I_col;
@@ -678,6 +680,7 @@ namespace vargas {
                           // Check for new max score.
                           _max_count[i] = 1;
                           _max_pos[i] = curr_pos;
+                          _max_node[i] = _curr_node_id;
                           _max_last_pos[i] = curr_pos;
                       }
                   }
@@ -711,6 +714,7 @@ namespace vargas {
                           // Check for new max score.
                           _max_count[i] = 1;
                           _max_pos[i] = curr_pos;
+                          _max_node[i] = _curr_node_id;
                           _max_last_pos[i] = curr_pos;
                           _waiting_pos[i] = 0;
                           _waiting_score[i] = _sub_score[i];
@@ -807,6 +811,8 @@ namespace vargas {
       pos_t *_max_pos, *_sub_pos, *_waiting_pos;
       pos_t *_max_last_pos, *_sub_last_pos, *_waiting_last_pos;
       unsigned  *_max_count, *_sub_count;
+      unsigned  *_max_node;      // graph node id of the current max cell (parallels _max_pos)
+      unsigned  _curr_node_id;   // id of the node currently being filled (set in _fill_node)
 
       native_t _bias;
       const unsigned int _read_len;
